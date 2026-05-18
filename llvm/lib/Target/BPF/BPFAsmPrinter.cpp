@@ -36,11 +36,92 @@
 #include "llvm/MC/MCSymbolELF.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
+#include <cassert>
 using namespace llvm;
 
 #define DEBUG_TYPE "asm-printer"
+
+namespace {
+constexpr uint64_t X86FormImm = 2;
+
+unsigned getBPFRegNo(Register Reg) {
+  switch (Reg) {
+  case BPF::R0:
+  case BPF::W0:
+    return 0;
+  case BPF::R1:
+  case BPF::W1:
+    return 1;
+  case BPF::R2:
+  case BPF::W2:
+    return 2;
+  case BPF::R3:
+  case BPF::W3:
+    return 3;
+  case BPF::R4:
+  case BPF::W4:
+    return 4;
+  case BPF::R5:
+  case BPF::W5:
+    return 5;
+  case BPF::R6:
+  case BPF::W6:
+    return 6;
+  case BPF::R7:
+  case BPF::W7:
+    return 7;
+  case BPF::R8:
+  case BPF::W8:
+    return 8;
+  case BPF::R9:
+  case BPF::W9:
+    return 9;
+  case BPF::R10:
+  case BPF::W10:
+    return 10;
+  default:
+    llvm_unreachable("unexpected BPF kinsn register");
+  }
+}
+
+uint64_t packU4(uint64_t Value, unsigned Shift) {
+  assert(Value < 16 && "payload nibble overflow");
+  return Value << Shift;
+}
+
+uint64_t packU8(uint64_t Value, unsigned Shift) {
+  assert(Value < 256 && "payload byte overflow");
+  return Value << Shift;
+}
+
+uint64_t packX86RotateImmPayload(Register Dst, Register Src, uint64_t Shift) {
+  if (Dst != Src)
+    report_fatal_error("bpf_x86_rolq requires tied dst/src registers");
+  return X86FormImm | packU4(getBPFRegNo(Dst), 4) |
+         packU4(getBPFRegNo(Src), 8) | packU8(Shift, 12);
+}
+
+uint64_t packX86UnaryImmPayload(Register Dst, Register Src) {
+  if (Dst != Src)
+    report_fatal_error("bpf_x86_bswapq requires tied dst/src registers");
+  return X86FormImm | packU4(getBPFRegNo(Dst), 4);
+}
+
+uint64_t packX86CmovPayload(Register Dst, Register Src) {
+  return packU4(getBPFRegNo(Dst), 0) | packU4(getBPFRegNo(Src), 4);
+}
+
+void splitKinsnPayload(uint64_t Payload, unsigned &Dst, unsigned &Off,
+                       unsigned &Imm) {
+  Dst = Payload & 0xf;
+  Off = (Payload >> 4) & 0xffff;
+  Imm = (Payload >> 20) & 0xffffffff;
+  assert((Payload >> 52) == 0 && "kinsn payload exceeds sidecar capacity");
+}
+} // namespace
 
 BPFAsmPrinter::BPFAsmPrinter(TargetMachine &TM,
                              std::unique_ptr<MCStreamer> Streamer)
@@ -162,19 +243,67 @@ bool BPFAsmPrinter::PrintAsmMemoryOperand(const MachineInstr *MI,
   assert(OpNum + 1 < MI->getNumOperands() && "Insufficient operands");
   const MachineOperand &BaseMO = MI->getOperand(OpNum);
   const MachineOperand &OffsetMO = MI->getOperand(OpNum + 1);
-  assert(BaseMO.isReg() && "Unexpected base pointer for inline asm memory operand.");
-  assert(OffsetMO.isImm() && "Unexpected offset for inline asm memory operand.");
+  assert(BaseMO.isReg() &&
+         "Unexpected base pointer for inline asm memory operand.");
+  assert(OffsetMO.isImm() &&
+         "Unexpected offset for inline asm memory operand.");
   int Offset = OffsetMO.getImm();
 
   if (ExtraCode)
     return true; // Unknown modifier.
 
   if (Offset < 0)
-    O << "(" << BPFInstPrinter::getRegisterName(BaseMO.getReg()) << " - " << -Offset << ")";
+    O << "(" << BPFInstPrinter::getRegisterName(BaseMO.getReg()) << " - "
+      << -Offset << ")";
   else
-    O << "(" << BPFInstPrinter::getRegisterName(BaseMO.getReg()) << " + " << Offset << ")";
+    O << "(" << BPFInstPrinter::getRegisterName(BaseMO.getReg()) << " + "
+      << Offset << ")";
 
   return false;
+}
+
+void BPFAsmPrinter::emitKinsnPair(uint64_t Payload, StringRef Callee) {
+  unsigned Dst, Off, Imm;
+  splitKinsnPayload(Payload, Dst, Off, Imm);
+
+  MCInst Sidecar;
+  Sidecar.setOpcode(BPF::KINSN_SIDECAR);
+  Sidecar.addOperand(MCOperand::createImm(Dst));
+  Sidecar.addOperand(MCOperand::createImm(Off));
+  Sidecar.addOperand(MCOperand::createImm(Imm));
+  EmitToStreamer(*OutStreamer, Sidecar);
+
+  MCInst Call;
+  Call.setOpcode(BPF::KINSN_CALL);
+  MCSymbol *Sym = GetExternalSymbolSymbol(Callee);
+  Call.addOperand(
+      MCOperand::createExpr(MCSymbolRefExpr::create(Sym, OutContext)));
+  EmitToStreamer(*OutStreamer, Call);
+}
+
+bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
+  switch (MI->getOpcode()) {
+  case BPF::BPF_KINSN_X86_ROLQ:
+    emitKinsnPair(packX86RotateImmPayload(MI->getOperand(0).getReg(),
+                                          MI->getOperand(1).getReg(),
+                                          MI->getOperand(2).getImm()),
+                  "bpf_x86_rolq");
+    return true;
+  case BPF::BPF_KINSN_X86_BSWAPQ:
+    emitKinsnPair(packX86UnaryImmPayload(MI->getOperand(0).getReg(),
+                                         MI->getOperand(1).getReg()),
+                  "bpf_x86_bswapq");
+    return true;
+  case BPF::BPF_KINSN_X86_CMOVNEQ:
+    emitKinsnPair(packX86CmovPayload(MI->getOperand(0).getReg(),
+                                     MI->getOperand(2).getReg()),
+                  "bpf_x86_cmovneq");
+    return true;
+  case BPF::BPF_KINSN_ARM64_EXTR_X:
+    llvm_unreachable("arm64 kinsn pseudo reached BPF x86 asm printer");
+  default:
+    return false;
+  }
 }
 
 void BPFAsmPrinter::emitInstruction(const MachineInstr *MI) {
@@ -187,6 +316,9 @@ void BPFAsmPrinter::emitInstruction(const MachineInstr *MI) {
       }
     }
   }
+
+  if (emitKinsnPseudo(MI))
+    return;
 
   BPF_MC::verifyInstructionPredicates(MI->getOpcode(),
                                       getSubtargetInfo().getFeatureBits());

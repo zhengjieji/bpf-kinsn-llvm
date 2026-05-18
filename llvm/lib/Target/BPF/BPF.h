@@ -27,6 +27,7 @@ class PassRegistry;
 ModulePass *createBPFCheckAndAdjustIR();
 
 FunctionPass *createBPFISelDag(BPFTargetMachine &TM);
+FunctionPass *createBPFKinsnSelectPass();
 FunctionPass *createBPFMISimplifyPatchablePass();
 FunctionPass *createBPFMIPeepholePass();
 FunctionPass *createBPFMIPreEmitPeepholePass();
@@ -37,7 +38,8 @@ InstructionSelector *createBPFInstructionSelector(const BPFTargetMachine &,
                                                   const BPFRegisterBankInfo &);
 
 void initializeBPFAsmPrinterPass(PassRegistry &);
-void initializeBPFCheckAndAdjustIRPass(PassRegistry&);
+void initializeBPFCheckAndAdjustIRPass(PassRegistry &);
+void initializeBPFKinsnSelectPass(PassRegistry &);
 void initializeBPFDAGToDAGISelLegacyPass(PassRegistry &);
 void initializeBPFMIPeepholePass(PassRegistry &);
 void initializeBPFMIPreEmitCheckingPass(PassRegistry &);

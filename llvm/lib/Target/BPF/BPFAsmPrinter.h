@@ -43,6 +43,8 @@ private:
   bool SawTrapCall = false;
 
   const BPFTargetMachine &getBTM() const;
+  void emitKinsnPair(uint64_t Payload, StringRef Callee);
+  bool emitKinsnPseudo(const MachineInstr *MI);
 };
 
 } // namespace llvm

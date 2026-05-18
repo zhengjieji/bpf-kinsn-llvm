@@ -35,9 +35,9 @@
 #include <optional>
 using namespace llvm;
 
-static cl::
-opt<bool> DisableMIPeephole("disable-bpf-peephole", cl::Hidden,
-                            cl::desc("Disable machine peepholes for BPF"));
+static cl::opt<bool>
+    DisableMIPeephole("disable-bpf-peephole", cl::Hidden,
+                      cl::desc("Disable machine peepholes for BPF"));
 
 static cl::opt<bool>
     DisableCheckUnreachable("bpf-disable-trap-unreachable", cl::Hidden,
@@ -53,6 +53,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeBPFTarget() {
   initializeGlobalISel(PR);
   initializeBPFAsmPrinterPass(PR);
   initializeBPFCheckAndAdjustIRPass(PR);
+  initializeBPFKinsnSelectPass(PR);
   initializeBPFMIPeepholePass(PR);
   initializeBPFMIPreEmitPeepholePass(PR);
   initializeBPFDAGToDAGISelLegacyPass(PR);
@@ -108,7 +109,7 @@ public:
   bool addRegBankSelect() override;
   bool addGlobalInstructionSelect() override;
 };
-}
+} // namespace
 
 TargetPassConfig *BPFTargetMachine::createPassConfig(PassManagerBase &PM) {
   return new BPFPassConfig(*this, PM);
@@ -181,6 +182,7 @@ void BPFPassConfig::addMachineSSAOptimization() {
     if (Subtarget->getHasAlu32())
       addPass(createBPFMIPeepholePass());
   }
+  addPass(createBPFKinsnSelectPass());
 }
 
 void BPFPassConfig::addPreEmitPass() {

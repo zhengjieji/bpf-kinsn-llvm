@@ -814,6 +814,55 @@ let isCall=1, hasDelaySlot=0, Uses = [R11] in {
   def JALX  : CALLX<"callx">;
 }
 
+// Kinsn emission support.
+//
+// LLVM keeps the kfunc target symbolic here.  The loader/daemon is responsible
+// for resolving the kfunc name to a BTF id and module fd-array slot before
+// loading the program into a kinsn-aware kernel.
+def KINSN_SIDECAR
+    : TYPE_ALU_JMP<BPF_MOV.Value, BPF_K.Value,
+                   (outs),
+                   (ins i32imm:$dst, i32imm:$off, i32imm:$imm),
+                   "kinsn_sidecar\t$dst, $off, $imm",
+                   []> {
+  bits<4> dst;
+  bits<16> off;
+  bits<32> imm;
+
+  let Inst{55-52} = 3; // BPF_PSEUDO_KINSN_SIDECAR
+  let Inst{51-48} = dst;
+  let Inst{47-32} = off;
+  let Inst{31-0} = imm;
+  let BPFClass = BPF_ALU64;
+  let isCodeGenOnly = 1;
+  let hasSideEffects = 1;
+}
+
+let isCall = 1, hasDelaySlot = 0, Uses = [R11], isCodeGenOnly = 1,
+    hasSideEffects = 1 in {
+  def KINSN_CALL : CALL<"kinsn_call"> {
+    let Inst{55-52} = 4; // BPF_PSEUDO_KINSN_CALL
+  }
+}
+
+let hasSideEffects = 1, isCodeGenOnly = 1 in {
+  let Constraints = "$dst = $src" in {
+    def BPF_KINSN_X86_ROLQ
+        : Pseudo<(outs GPR:$dst), (ins GPR:$src, i32imm:$shift),
+                 "# BPF_KINSN_X86_ROLQ $dst, $src, $shift", []>;
+    def BPF_KINSN_X86_BSWAPQ
+        : Pseudo<(outs GPR:$dst), (ins GPR:$src),
+                 "# BPF_KINSN_X86_BSWAPQ $dst, $src", []>;
+  }
+  let Constraints = "$dst = $old" in
+    def BPF_KINSN_X86_CMOVNEQ
+        : Pseudo<(outs GPR:$dst), (ins GPR:$old, GPR:$src),
+                 "# BPF_KINSN_X86_CMOVNEQ $dst, $old, $src", []>;
+  def BPF_KINSN_ARM64_EXTR_X
+      : Pseudo<(outs GPR:$dst), (ins GPR:$lo, GPR:$hi, i32imm:$lsb),
+               "# BPF_KINSN_ARM64_EXTR_X $dst, $lo, $hi, $lsb", []>;
+}
+
 class NOP_I<string OpcodeStr>
     : TYPE_ALU_JMP<BPF_MOV.Value, BPF_X.Value,
                    (outs),

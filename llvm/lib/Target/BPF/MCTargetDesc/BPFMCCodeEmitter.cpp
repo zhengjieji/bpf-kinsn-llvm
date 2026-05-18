@@ -105,7 +105,7 @@ unsigned BPFMCCodeEmitter::getMachineOpValue(const MCInst &MI,
 
   assert(Expr->getKind() == MCExpr::SymbolRef);
 
-  if (MI.getOpcode() == BPF::JAL)
+  if (MI.getOpcode() == BPF::JAL || MI.getOpcode() == BPF::KINSN_CALL)
     // func call name
     addFixup(Fixups, 0, Expr, FK_Data_4, true);
   else if (MI.getOpcode() == BPF::LD_imm64)
@@ -119,8 +119,7 @@ unsigned BPFMCCodeEmitter::getMachineOpValue(const MCInst &MI,
   return 0;
 }
 
-static uint8_t SwapBits(uint8_t Val)
-{
+static uint8_t SwapBits(uint8_t Val) {
   return (Val & 0x0F) << 4 | (Val & 0xF0) >> 4;
 }
 
