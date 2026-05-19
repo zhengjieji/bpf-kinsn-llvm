@@ -143,6 +143,19 @@ uint64_t packX86SibPayload(Register Dst, Register Base, Register Index,
          (static_cast<uint64_t>(static_cast<uint16_t>(Offset)) << 20);
 }
 
+uint64_t packX86MovLoadPayload(const MachineInstr *MI) {
+  constexpr int64_t NoIndexScale = 4;
+  int64_t Scale = MI->getOperand(3).getImm();
+  if (Scale == NoIndexScale)
+    return packX86MemPayload(MI->getOperand(0).getReg(),
+                             MI->getOperand(1).getReg(),
+                             MI->getOperand(4).getImm());
+  return packX86SibPayload(MI->getOperand(0).getReg(),
+                           MI->getOperand(1).getReg(),
+                           MI->getOperand(2).getReg(), Scale,
+                           MI->getOperand(4).getImm());
+}
+
 uint64_t packX86ShdPayload(Register Dst, Register Src, uint64_t Shift) {
   return packU4(getBPFRegNo(Dst), 0) | packU4(getBPFRegNo(Src), 4) |
          packU8(Shift, 8);
@@ -269,10 +282,13 @@ bool BPFAsmPrinter::functionNeedsKinsnScratch() const {
       case BPF::BPF_KINSN_X86_MOVBE16:
       case BPF::BPF_KINSN_X86_MOVBE32:
       case BPF::BPF_KINSN_X86_MOVBE64:
-      case BPF::BPF_KINSN_X86_MOVZBL:
-      case BPF::BPF_KINSN_X86_MOVZWL:
-      case BPF::BPF_KINSN_X86_MOVL:
-      case BPF::BPF_KINSN_X86_MOVQ:
+        return true;
+      /*
+       * MOVZBL/MOVZWL/MOVL/MOVQ load pseudos are intentionally absent here.
+       * LLVM emits only BPF-register memory operands for them, and their
+       * early-clobber constraint keeps SIB destinations away from address regs,
+       * so the module proof takes its no-scratch verifier-native fast paths.
+       */
       case BPF::BPF_KINSN_X86_BEXTRQ:
       case BPF::BPF_KINSN_X86_BLSIQ:
       case BPF::BPF_KINSN_X86_BLSRQ:
@@ -455,36 +471,16 @@ bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
                   "bpf_x86_movbe64");
     return true;
   case BPF::BPF_KINSN_X86_MOVZBL:
-    emitKinsnPair(packX86SibPayload(MI->getOperand(0).getReg(),
-                                    MI->getOperand(1).getReg(),
-                                    MI->getOperand(2).getReg(),
-                                    MI->getOperand(3).getImm(),
-                                    MI->getOperand(4).getImm()),
-                  "bpf_x86_movzbl");
+    emitKinsnPair(packX86MovLoadPayload(MI), "bpf_x86_movzbl");
     return true;
   case BPF::BPF_KINSN_X86_MOVZWL:
-    emitKinsnPair(packX86SibPayload(MI->getOperand(0).getReg(),
-                                    MI->getOperand(1).getReg(),
-                                    MI->getOperand(2).getReg(),
-                                    MI->getOperand(3).getImm(),
-                                    MI->getOperand(4).getImm()),
-                  "bpf_x86_movzwl");
+    emitKinsnPair(packX86MovLoadPayload(MI), "bpf_x86_movzwl");
     return true;
   case BPF::BPF_KINSN_X86_MOVL:
-    emitKinsnPair(packX86SibPayload(MI->getOperand(0).getReg(),
-                                    MI->getOperand(1).getReg(),
-                                    MI->getOperand(2).getReg(),
-                                    MI->getOperand(3).getImm(),
-                                    MI->getOperand(4).getImm()),
-                  "bpf_x86_movl");
+    emitKinsnPair(packX86MovLoadPayload(MI), "bpf_x86_movl");
     return true;
   case BPF::BPF_KINSN_X86_MOVQ:
-    emitKinsnPair(packX86SibPayload(MI->getOperand(0).getReg(),
-                                    MI->getOperand(1).getReg(),
-                                    MI->getOperand(2).getReg(),
-                                    MI->getOperand(3).getImm(),
-                                    MI->getOperand(4).getImm()),
-                  "bpf_x86_movq");
+    emitKinsnPair(packX86MovLoadPayload(MI), "bpf_x86_movq");
     return true;
   case BPF::BPF_KINSN_X86_BEXTRQ:
     emitKinsnPair(packX86PlainRRRPayload(MI->getOperand(0).getReg(),
