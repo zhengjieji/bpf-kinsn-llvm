@@ -37,6 +37,7 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include <cassert>
@@ -45,7 +46,9 @@ using namespace llvm;
 #define DEBUG_TYPE "asm-printer"
 
 namespace {
+constexpr uint64_t X86FormRR = 1;
 constexpr uint64_t X86FormImm = 2;
+constexpr uint64_t X86FormMem = 4;
 
 unsigned getBPFRegNo(Register Reg) {
   switch (Reg) {
@@ -97,11 +100,39 @@ uint64_t packU8(uint64_t Value, unsigned Shift) {
   return Value << Shift;
 }
 
-uint64_t packX86RotateImmPayload(Register Dst, Register Src, uint64_t Shift) {
-  if (Dst != Src)
+uint64_t packX86RotateImmPayload(Register Dst, Register Src, uint64_t Shift,
+                                 bool RequireTied) {
+  if (RequireTied && Dst != Src)
     report_fatal_error("bpf_x86_rolq requires tied dst/src registers");
   return X86FormImm | packU4(getBPFRegNo(Dst), 4) |
          packU4(getBPFRegNo(Src), 8) | packU8(Shift, 12);
+}
+
+uint64_t packX86RRPayload(Register Dst, Register Src) {
+  return X86FormRR | packU4(getBPFRegNo(Dst), 4) |
+         packU4(getBPFRegNo(Src), 8);
+}
+
+uint64_t packX86PlainRRPayload(Register Dst, Register Src) {
+  return packU4(getBPFRegNo(Dst), 0) | packU4(getBPFRegNo(Src), 4);
+}
+
+uint64_t packX86PlainRRRPayload(Register Dst, Register Src, Register Ctl) {
+  return packU4(getBPFRegNo(Dst), 0) | packU4(getBPFRegNo(Src), 4) |
+         packU4(getBPFRegNo(Ctl), 8);
+}
+
+uint64_t packX86MemPayload(Register Dst, Register Base, int64_t Offset) {
+  if (!isInt<16>(Offset))
+    report_fatal_error("x86 memory kinsn offset exceeds s16 payload");
+  return X86FormMem | packU4(getBPFRegNo(Dst), 4) |
+         packU4(getBPFRegNo(Base), 8) |
+         (static_cast<uint64_t>(static_cast<uint16_t>(Offset)) << 12);
+}
+
+uint64_t packX86ShdPayload(Register Dst, Register Src, uint64_t Shift) {
+  return packU4(getBPFRegNo(Dst), 0) | packU4(getBPFRegNo(Src), 4) |
+         packU8(Shift, 8);
 }
 
 uint64_t packX86UnaryImmPayload(Register Dst, Register Src) {
@@ -188,6 +219,55 @@ bool BPFAsmPrinter::doFinalization(Module &M) {
   }
 
   return AsmPrinter::doFinalization(M);
+}
+
+bool BPFAsmPrinter::functionNeedsKinsnScratch() const {
+  for (const MachineBasicBlock &MBB : *MF)
+    for (const MachineInstr &MI : MBB)
+      switch (MI.getOpcode()) {
+      case BPF::BPF_KINSN_X86_ROLQ:
+      case BPF::BPF_KINSN_X86_RORXL:
+      case BPF::BPF_KINSN_X86_BSWAPQ:
+      case BPF::BPF_KINSN_X86_POPCNTQ:
+      case BPF::BPF_KINSN_X86_MOVBE16:
+      case BPF::BPF_KINSN_X86_MOVBE32:
+      case BPF::BPF_KINSN_X86_MOVBE64:
+      case BPF::BPF_KINSN_X86_BEXTRQ:
+      case BPF::BPF_KINSN_X86_BLSIQ:
+      case BPF::BPF_KINSN_X86_BLSRQ:
+      case BPF::BPF_KINSN_X86_CMPL:
+      case BPF::BPF_KINSN_X86_CMPQ:
+      case BPF::BPF_KINSN_X86_SHLDL:
+      case BPF::BPF_KINSN_X86_SHLDQ:
+      case BPF::BPF_KINSN_X86_SHRDL:
+      case BPF::BPF_KINSN_X86_SHRDQ:
+      case BPF::BPF_KINSN_X86_CMOVEL:
+      case BPF::BPF_KINSN_X86_CMOVEQ:
+      case BPF::BPF_KINSN_X86_CMOVNEL:
+      case BPF::BPF_KINSN_X86_CMOVNEQ:
+      case BPF::BPF_KINSN_X86_CMOVBL:
+      case BPF::BPF_KINSN_X86_CMOVBQ:
+        return true;
+      default:
+        break;
+      }
+  return false;
+}
+
+void BPFAsmPrinter::emitScratchInit() {
+  for (Register Reg : {BPF::R6, BPF::R7, BPF::R8}) {
+    MCInst Init;
+    Init.setOpcode(BPF::MOV_ri);
+    Init.addOperand(MCOperand::createReg(Reg));
+    Init.addOperand(MCOperand::createImm(0));
+    EmitToStreamer(*OutStreamer, Init);
+  }
+}
+
+void BPFAsmPrinter::emitFunctionBodyStart() {
+  AsmPrinter::emitFunctionBodyStart();
+  if (functionNeedsKinsnScratch())
+    emitScratchInit();
 }
 
 void BPFAsmPrinter::printOperand(const MachineInstr *MI, int OpNum,
@@ -286,18 +366,122 @@ bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
   case BPF::BPF_KINSN_X86_ROLQ:
     emitKinsnPair(packX86RotateImmPayload(MI->getOperand(0).getReg(),
                                           MI->getOperand(1).getReg(),
-                                          MI->getOperand(2).getImm()),
+                                          MI->getOperand(2).getImm(), true),
                   "bpf_x86_rolq");
+    return true;
+  case BPF::BPF_KINSN_X86_RORXL:
+    emitKinsnPair(packX86RotateImmPayload(MI->getOperand(0).getReg(),
+                                          MI->getOperand(1).getReg(),
+                                          MI->getOperand(2).getImm(), false),
+                  "bpf_x86_rorxl");
     return true;
   case BPF::BPF_KINSN_X86_BSWAPQ:
     emitKinsnPair(packX86UnaryImmPayload(MI->getOperand(0).getReg(),
                                          MI->getOperand(1).getReg()),
                   "bpf_x86_bswapq");
     return true;
+  case BPF::BPF_KINSN_X86_POPCNTQ:
+    emitKinsnPair(packX86RRPayload(MI->getOperand(0).getReg(),
+                                   MI->getOperand(1).getReg()),
+                  "bpf_x86_popcntq");
+    return true;
+  case BPF::BPF_KINSN_X86_MOVBE16:
+    emitKinsnPair(packX86MemPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(2).getReg(),
+                                    MI->getOperand(3).getImm()),
+                  "bpf_x86_movbe16");
+    return true;
+  case BPF::BPF_KINSN_X86_MOVBE32:
+    emitKinsnPair(packX86MemPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(1).getReg(),
+                                    MI->getOperand(2).getImm()),
+                  "bpf_x86_movbe32");
+    return true;
+  case BPF::BPF_KINSN_X86_MOVBE64:
+    emitKinsnPair(packX86MemPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(1).getReg(),
+                                    MI->getOperand(2).getImm()),
+                  "bpf_x86_movbe64");
+    return true;
+  case BPF::BPF_KINSN_X86_BEXTRQ:
+    emitKinsnPair(packX86PlainRRRPayload(MI->getOperand(0).getReg(),
+                                         MI->getOperand(1).getReg(),
+                                         MI->getOperand(2).getReg()),
+                  "bpf_x86_bextrq");
+    return true;
+  case BPF::BPF_KINSN_X86_BLSIQ:
+    emitKinsnPair(packX86PlainRRPayload(MI->getOperand(0).getReg(),
+                                        MI->getOperand(1).getReg()),
+                  "bpf_x86_blsiq");
+    return true;
+  case BPF::BPF_KINSN_X86_BLSRQ:
+    emitKinsnPair(packX86PlainRRPayload(MI->getOperand(0).getReg(),
+                                        MI->getOperand(1).getReg()),
+                  "bpf_x86_blsrq");
+    return true;
+  case BPF::BPF_KINSN_X86_CMPL:
+    emitKinsnPair(packX86RRPayload(MI->getOperand(0).getReg(),
+                                   MI->getOperand(1).getReg()),
+                  "bpf_x86_cmpl");
+    return true;
+  case BPF::BPF_KINSN_X86_CMPQ:
+    emitKinsnPair(packX86RRPayload(MI->getOperand(0).getReg(),
+                                   MI->getOperand(1).getReg()),
+                  "bpf_x86_cmpq");
+    return true;
+  case BPF::BPF_KINSN_X86_SHLDL:
+    emitKinsnPair(packX86ShdPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(2).getReg(),
+                                    MI->getOperand(3).getImm()),
+                  "bpf_x86_shldl");
+    return true;
+  case BPF::BPF_KINSN_X86_SHLDQ:
+    emitKinsnPair(packX86ShdPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(2).getReg(),
+                                    MI->getOperand(3).getImm()),
+                  "bpf_x86_shldq");
+    return true;
+  case BPF::BPF_KINSN_X86_SHRDL:
+    emitKinsnPair(packX86ShdPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(2).getReg(),
+                                    MI->getOperand(3).getImm()),
+                  "bpf_x86_shrdl");
+    return true;
+  case BPF::BPF_KINSN_X86_SHRDQ:
+    emitKinsnPair(packX86ShdPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(2).getReg(),
+                                    MI->getOperand(3).getImm()),
+                  "bpf_x86_shrdq");
+    return true;
+  case BPF::BPF_KINSN_X86_CMOVEL:
+    emitKinsnPair(packX86CmovPayload(MI->getOperand(0).getReg(),
+                                     MI->getOperand(2).getReg()),
+                  "bpf_x86_cmovel");
+    return true;
+  case BPF::BPF_KINSN_X86_CMOVEQ:
+    emitKinsnPair(packX86CmovPayload(MI->getOperand(0).getReg(),
+                                     MI->getOperand(2).getReg()),
+                  "bpf_x86_cmoveq");
+    return true;
+  case BPF::BPF_KINSN_X86_CMOVNEL:
+    emitKinsnPair(packX86CmovPayload(MI->getOperand(0).getReg(),
+                                     MI->getOperand(2).getReg()),
+                  "bpf_x86_cmovnel");
+    return true;
   case BPF::BPF_KINSN_X86_CMOVNEQ:
     emitKinsnPair(packX86CmovPayload(MI->getOperand(0).getReg(),
                                      MI->getOperand(2).getReg()),
                   "bpf_x86_cmovneq");
+    return true;
+  case BPF::BPF_KINSN_X86_CMOVBL:
+    emitKinsnPair(packX86CmovPayload(MI->getOperand(0).getReg(),
+                                     MI->getOperand(2).getReg()),
+                  "bpf_x86_cmovbl");
+    return true;
+  case BPF::BPF_KINSN_X86_CMOVBQ:
+    emitKinsnPair(packX86CmovPayload(MI->getOperand(0).getReg(),
+                                     MI->getOperand(2).getReg()),
+                  "bpf_x86_cmovbq");
     return true;
   case BPF::BPF_KINSN_ARM64_EXTR_X:
     llvm_unreachable("arm64 kinsn pseudo reached BPF x86 asm printer");

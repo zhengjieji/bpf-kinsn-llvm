@@ -854,10 +854,75 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
         : Pseudo<(outs GPR:$dst), (ins GPR:$src),
                  "# BPF_KINSN_X86_BSWAPQ $dst, $src", []>;
   }
-  let Constraints = "$dst = $old" in
+  def BPF_KINSN_X86_RORXL
+      : Pseudo<(outs GPR32:$dst), (ins GPR32:$src, i32imm:$shift),
+               "# BPF_KINSN_X86_RORXL $dst, $src, $shift", []>;
+  def BPF_KINSN_X86_POPCNTQ
+      : Pseudo<(outs GPR:$dst), (ins GPR:$src),
+               "# BPF_KINSN_X86_POPCNTQ $dst, $src",
+               [(set GPR:$dst, (ctpop GPR:$src))]>;
+  let Constraints = "$dst = $old" in {
+    def BPF_KINSN_X86_MOVBE16
+        : Pseudo<(outs GPR32:$dst), (ins GPR32:$old, MEMri:$addr),
+                 "# BPF_KINSN_X86_MOVBE16 $dst, $old, $addr", []>;
+  }
+  def BPF_KINSN_X86_MOVBE32
+      : Pseudo<(outs GPR:$dst), (ins MEMri:$addr),
+               "# BPF_KINSN_X86_MOVBE32 $dst, $addr", []>;
+  def BPF_KINSN_X86_MOVBE64
+      : Pseudo<(outs GPR:$dst), (ins MEMri:$addr),
+               "# BPF_KINSN_X86_MOVBE64 $dst, $addr", []>;
+  def BPF_KINSN_X86_BEXTRQ
+      : Pseudo<(outs GPR:$dst), (ins GPR:$src, GPR:$ctl),
+               "# BPF_KINSN_X86_BEXTRQ $dst, $src, $ctl", []>;
+  def BPF_KINSN_X86_BLSIQ
+      : Pseudo<(outs GPR:$dst), (ins GPR:$src),
+               "# BPF_KINSN_X86_BLSIQ $dst, $src", []>;
+  def BPF_KINSN_X86_BLSRQ
+      : Pseudo<(outs GPR:$dst), (ins GPR:$src),
+               "# BPF_KINSN_X86_BLSRQ $dst, $src", []>;
+  def BPF_KINSN_X86_CMPL
+      : Pseudo<(outs), (ins GPR32:$lhs, GPR32:$rhs),
+               "# BPF_KINSN_X86_CMPL $lhs, $rhs", []>;
+  def BPF_KINSN_X86_CMPQ
+      : Pseudo<(outs), (ins GPR:$lhs, GPR:$rhs),
+               "# BPF_KINSN_X86_CMPQ $lhs, $rhs", []>;
+  let Constraints = "$dst = $lhs" in {
+    def BPF_KINSN_X86_SHLDQ
+        : Pseudo<(outs GPR:$dst), (ins GPR:$lhs, GPR:$src, i32imm:$shift),
+                 "# BPF_KINSN_X86_SHLDQ $dst, $lhs, $src, $shift", []>;
+    def BPF_KINSN_X86_SHRDQ
+        : Pseudo<(outs GPR:$dst), (ins GPR:$lhs, GPR:$src, i32imm:$shift),
+                 "# BPF_KINSN_X86_SHRDQ $dst, $lhs, $src, $shift", []>;
+    def BPF_KINSN_X86_SHLDL
+        : Pseudo<(outs GPR32:$dst),
+                 (ins GPR32:$lhs, GPR32:$src, i32imm:$shift),
+                 "# BPF_KINSN_X86_SHLDL $dst, $lhs, $src, $shift", []>;
+    def BPF_KINSN_X86_SHRDL
+        : Pseudo<(outs GPR32:$dst),
+                 (ins GPR32:$lhs, GPR32:$src, i32imm:$shift),
+                 "# BPF_KINSN_X86_SHRDL $dst, $lhs, $src, $shift", []>;
+  }
+  let Constraints = "$dst = $old" in {
+    def BPF_KINSN_X86_CMOVEL
+        : Pseudo<(outs GPR32:$dst), (ins GPR32:$old, GPR32:$src),
+                 "# BPF_KINSN_X86_CMOVEL $dst, $old, $src", []>;
+    def BPF_KINSN_X86_CMOVEQ
+        : Pseudo<(outs GPR:$dst), (ins GPR:$old, GPR:$src),
+                 "# BPF_KINSN_X86_CMOVEQ $dst, $old, $src", []>;
+    def BPF_KINSN_X86_CMOVNEL
+        : Pseudo<(outs GPR32:$dst), (ins GPR32:$old, GPR32:$src),
+                 "# BPF_KINSN_X86_CMOVNEL $dst, $old, $src", []>;
     def BPF_KINSN_X86_CMOVNEQ
         : Pseudo<(outs GPR:$dst), (ins GPR:$old, GPR:$src),
                  "# BPF_KINSN_X86_CMOVNEQ $dst, $old, $src", []>;
+    def BPF_KINSN_X86_CMOVBL
+        : Pseudo<(outs GPR32:$dst), (ins GPR32:$old, GPR32:$src),
+                 "# BPF_KINSN_X86_CMOVBL $dst, $old, $src", []>;
+    def BPF_KINSN_X86_CMOVBQ
+        : Pseudo<(outs GPR:$dst), (ins GPR:$old, GPR:$src),
+                 "# BPF_KINSN_X86_CMOVBQ $dst, $old, $src", []>;
+  }
   def BPF_KINSN_ARM64_EXTR_X
       : Pseudo<(outs GPR:$dst), (ins GPR:$lo, GPR:$hi, i32imm:$lsb),
                "# BPF_KINSN_ARM64_EXTR_X $dst, $lo, $hi, $lsb", []>;

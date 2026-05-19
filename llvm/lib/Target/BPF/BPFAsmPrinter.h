@@ -30,6 +30,7 @@ public:
   bool PrintAsmMemoryOperand(const MachineInstr *MI, unsigned OpNum,
                              const char *ExtraCode, raw_ostream &O) override;
 
+  void emitFunctionBodyStart() override;
   void emitInstruction(const MachineInstr *MI) override;
   void emitFunctionBodyEnd() override;
   MCSymbol *getJTPublicSymbol(unsigned JTI);
@@ -43,6 +44,8 @@ private:
   bool SawTrapCall = false;
 
   const BPFTargetMachine &getBTM() const;
+  bool functionNeedsKinsnScratch() const;
+  void emitScratchInit();
   void emitKinsnPair(uint64_t Payload, StringRef Callee);
   bool emitKinsnPseudo(const MachineInstr *MI);
 };

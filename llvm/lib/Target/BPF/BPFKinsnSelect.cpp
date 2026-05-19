@@ -17,25 +17,36 @@
 #include "BPF.h"
 #include "BPFInstrInfo.h"
 #include "BPFTargetMachine.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/InitializePasses.h"
+#include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "bpf-kinsn-select"
 
-static cl::opt<bool>
+cl::opt<bool>
     EnableBPFKinsnSelect("bpf-enable-kinsn-select", cl::Hidden, cl::init(false),
                          cl::desc("Enable BPF kinsn MachineInstr selection"));
 
 STATISTIC(NumUnarySelected, "Number of unary kinsn pseudos selected");
+STATISTIC(NumMovbeSelected, "Number of movbe kinsn pseudos selected");
+STATISTIC(NumBextrSelected, "Number of BEXTR kinsn pseudos selected");
+STATISTIC(NumBmi1Selected, "Number of BMI1 kinsn pseudos selected");
 STATISTIC(NumRotateSelected, "Number of rotate kinsn pseudos selected");
-STATISTIC(NumScratchInitInserted,
-          "Number of kinsn verifier scratch initializers inserted");
+STATISTIC(NumShdSelected, "Number of SHLD/SHRD kinsn pseudos selected");
+STATISTIC(NumCandidatesSkipped,
+          "Number of non-profitable or overlapping kinsn candidates skipped");
 
 namespace {
 
@@ -50,6 +61,21 @@ constexpr UnaryPattern UnaryPatterns[] = {
     {BPF::LE64, BPF::BPF_KINSN_X86_BSWAPQ},
 };
 
+struct MovbePattern {
+  unsigned SwapOpcode;
+  unsigned LoadOpcode;
+  unsigned PseudoOpcode;
+};
+
+constexpr MovbePattern MovbePatterns[] = {
+    {BPF::BSWAP32, BPF::LDW, BPF::BPF_KINSN_X86_MOVBE32},
+    {BPF::BE32, BPF::LDW, BPF::BPF_KINSN_X86_MOVBE32},
+    {BPF::LE32, BPF::LDW, BPF::BPF_KINSN_X86_MOVBE32},
+    {BPF::BSWAP64, BPF::LDD, BPF::BPF_KINSN_X86_MOVBE64},
+    {BPF::BE64, BPF::LDD, BPF::BPF_KINSN_X86_MOVBE64},
+    {BPF::LE64, BPF::LDD, BPF::BPF_KINSN_X86_MOVBE64},
+};
+
 struct RotatePattern {
   unsigned OrOpcode;
   unsigned LeftShiftOpcode;
@@ -60,6 +86,39 @@ struct RotatePattern {
 
 constexpr RotatePattern RotatePatterns[] = {
     {BPF::OR_rr, BPF::SLL_ri, BPF::SRL_ri, 64, BPF::BPF_KINSN_X86_ROLQ},
+    {BPF::OR_rr_32, BPF::SLL_ri_32, BPF::SRL_ri_32, 32,
+     BPF::BPF_KINSN_X86_RORXL},
+};
+
+struct ShdPattern {
+  unsigned OrOpcode;
+  unsigned LhsShiftOpcode;
+  unsigned SrcShiftOpcode;
+  unsigned Width;
+  unsigned PseudoOpcode;
+};
+
+constexpr ShdPattern ShdPatterns[] = {
+    {BPF::OR_rr, BPF::SLL_ri, BPF::SRL_ri, 64, BPF::BPF_KINSN_X86_SHLDQ},
+    {BPF::OR_rr, BPF::SRL_ri, BPF::SLL_ri, 64, BPF::BPF_KINSN_X86_SHRDQ},
+    {BPF::OR_rr_32, BPF::SLL_ri_32, BPF::SRL_ri_32, 32,
+     BPF::BPF_KINSN_X86_SHLDL},
+    {BPF::OR_rr_32, BPF::SRL_ri_32, BPF::SLL_ri_32, 32,
+     BPF::BPF_KINSN_X86_SHRDL},
+};
+
+struct Candidate {
+  enum Kind { Unary, Movbe, Movbe16BE, Bextr, Bmi1, Rotate, Shd } K;
+  MachineInstr *Root;
+  MachineInstr *Left = nullptr;
+  MachineInstr *Right = nullptr;
+  MachineInstr *Extra = nullptr;
+  unsigned PseudoOpcode;
+  Register Src;
+  Register Base;
+  int64_t Offset = 0;
+  unsigned Shift = 0;
+  int Score;
 };
 
 class BPFKinsnSelect final : public MachineFunctionPass {
@@ -70,6 +129,12 @@ public:
 
   StringRef getPassName() const override { return "BPF kinsn selector"; }
 
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<MachineLoopInfoWrapperPass>();
+    AU.addPreserved<MachineLoopInfoWrapperPass>();
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+
   bool runOnMachineFunction(MachineFunction &MF) override {
     if (!EnableBPFKinsnSelect || skipFunction(MF.getFunction()) ||
         isLocalSubprog(MF.getFunction()))
@@ -77,27 +142,35 @@ public:
 
     TII = MF.getSubtarget<BPFSubtarget>().getInstrInfo();
     MRI = &MF.getRegInfo();
+    Loops = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
 
-    bool Changed = false;
-    bool SelectedKinsn = false;
+    SmallVector<Candidate, 16> Candidates;
     for (MachineBasicBlock &MBB : MF) {
-      for (MachineBasicBlock::iterator I = MBB.begin(), E = MBB.end();
-           I != E;) {
-        MachineInstr &MI = *I++;
-        if (selectUnary(MI) || selectRotate(MI)) {
-          Changed = true;
-          SelectedKinsn = true;
-        }
-      }
+      for (MachineInstr &MI : MBB)
+        collectCandidates(MI, Candidates);
     }
-    if (SelectedKinsn)
-      initializeScratchRegs(MF);
+
+    llvm::stable_sort(Candidates, [](const Candidate &A, const Candidate &B) {
+      return A.Score > B.Score;
+    });
+
+    DenseSet<MachineInstr *> Used;
+    bool Changed = false;
+    for (Candidate &C : Candidates) {
+      if (C.Score <= 0 || overlaps(C, Used)) {
+        ++NumCandidatesSkipped;
+        continue;
+      }
+      markUsed(C, Used);
+      Changed |= applyCandidate(C);
+    }
     return Changed;
   }
 
 private:
   const BPFInstrInfo *TII = nullptr;
   MachineRegisterInfo *MRI = nullptr;
+  MachineLoopInfo *Loops = nullptr;
 
   static bool isLocalSubprog(const Function &F) {
     StringRef Section = F.getSection();
@@ -105,31 +178,228 @@ private:
            Section.starts_with(".text.");
   }
 
-  void initializeScratchRegs(MachineFunction &MF) {
-    MachineBasicBlock &Entry = MF.front();
-    MachineBasicBlock::iterator InsertPt = Entry.begin();
-    const DebugLoc DL;
-
-    for (unsigned Reg : {BPF::R6, BPF::R7, BPF::R8}) {
-      BuildMI(Entry, InsertPt, DL, TII->get(BPF::MOV_ri), Reg).addImm(0);
-      ++NumScratchInitInserted;
-    }
+  int blockWeight(const MachineBasicBlock &MBB) const {
+    const MachineLoop *Loop = Loops ? Loops->getLoopFor(&MBB) : nullptr;
+    return Loop ? 4 + Loop->getLoopDepth() : 1;
   }
 
-  bool selectUnary(MachineInstr &MI) {
+  void collectCandidates(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    collectUnary(MI, Out);
+    collectMovbe16BE(MI, Out);
+    collectMovbe(MI, Out);
+    collectBextr(MI, Out);
+    collectBmi1(MI, Out);
+    collectRotate(MI, Out);
+    collectShd(MI, Out);
+  }
+
+  void collectUnary(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
     for (const UnaryPattern &Pattern : UnaryPatterns) {
       if (MI.getOpcode() != Pattern.Opcode)
         continue;
 
-      MachineBasicBlock &MBB = *MI.getParent();
-      BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(Pattern.PseudoOpcode),
-              MI.getOperand(0).getReg())
-          .addReg(MI.getOperand(1).getReg());
-      MI.eraseFromParent();
-      ++NumUnarySelected;
-      return true;
+      int Score = blockWeight(*MI.getParent()) - 2;
+      Out.push_back(
+          {Candidate::Unary, &MI, nullptr, nullptr, nullptr, Pattern.PseudoOpcode,
+           MI.getOperand(1).getReg(), Register(), 0, 0, Score});
+      return;
     }
-    return false;
+  }
+
+  static bool isByteLoad32(const MachineInstr *MI) {
+    return MI && MI->getOpcode() == BPF::LDB32;
+  }
+
+  bool matchMovbe16LoadPair(Register HighReg, Register LowReg, Register &Base,
+                            int64_t &Offset, MachineInstr *&HighLoad,
+                            MachineInstr *&LowLoad) const {
+    if (!HighReg.isVirtual() || !LowReg.isVirtual() ||
+        !MRI->hasOneNonDBGUse(HighReg) || !MRI->hasOneNonDBGUse(LowReg))
+      return false;
+
+    HighLoad = MRI->getVRegDef(HighReg);
+    LowLoad = MRI->getVRegDef(LowReg);
+    if (!isByteLoad32(HighLoad) || !isByteLoad32(LowLoad) ||
+        HighLoad->getParent() != LowLoad->getParent())
+      return false;
+
+    Register HighBase = HighLoad->getOperand(1).getReg();
+    Register LowBase = LowLoad->getOperand(1).getReg();
+    int64_t HighOff = HighLoad->getOperand(2).getImm();
+    int64_t LowOff = LowLoad->getOperand(2).getImm();
+    if (HighBase != LowBase || LowOff != HighOff + 1 || !isInt<16>(HighOff))
+      return false;
+
+    Base = HighBase;
+    Offset = HighOff;
+    return true;
+  }
+
+  void collectMovbe16BE(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    if (MI.getOpcode() != BPF::AND_ri_32 || MI.getOperand(2).getImm() != 0xffff)
+      return;
+
+    Register OrReg = MI.getOperand(1).getReg();
+    if (!OrReg.isVirtual() || !MRI->hasOneNonDBGUse(OrReg))
+      return;
+
+    MachineInstr *OrMI = MRI->getVRegDef(OrReg);
+    if (!OrMI || OrMI->getOpcode() != BPF::OR_rr_32 ||
+        OrMI->getParent() != MI.getParent())
+      return;
+
+    Register A = OrMI->getOperand(1).getReg();
+    Register B = OrMI->getOperand(2).getReg();
+    MachineInstr *ShiftMI = nullptr;
+    Register LowReg;
+
+    auto MatchShift = [&](Register Reg) -> bool {
+      if (!Reg.isVirtual() || !MRI->hasOneNonDBGUse(Reg))
+        return false;
+      ShiftMI = MRI->getVRegDef(Reg);
+      return ShiftMI && ShiftMI->getOpcode() == BPF::SLL_ri_32 &&
+             ShiftMI->getParent() == MI.getParent() &&
+             ShiftMI->getOperand(2).getImm() == 8;
+    };
+
+    if (MatchShift(A)) {
+      LowReg = B;
+    } else if (MatchShift(B)) {
+      LowReg = A;
+    } else {
+      return;
+    }
+
+    Register Base;
+    int64_t Offset;
+    MachineInstr *HighLoad = nullptr;
+    MachineInstr *LowLoad = nullptr;
+    if (!matchMovbe16LoadPair(ShiftMI->getOperand(1).getReg(), LowReg, Base,
+                              Offset, HighLoad, LowLoad))
+      return;
+
+    int Score = blockWeight(*MI.getParent()) * 4 - 1;
+    Out.push_back({Candidate::Movbe16BE, &MI, OrMI, ShiftMI, nullptr,
+                   BPF::BPF_KINSN_X86_MOVBE16, Register(), Base, Offset, 0,
+                   Score});
+  }
+
+  void collectMovbe(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    for (const MovbePattern &Pattern : MovbePatterns) {
+      if (MI.getOpcode() != Pattern.SwapOpcode)
+        continue;
+
+      Register LoadReg = MI.getOperand(1).getReg();
+      if (!LoadReg.isVirtual() || !MRI->hasOneNonDBGUse(LoadReg))
+        continue;
+
+      MachineInstr *LoadMI = MRI->getVRegDef(LoadReg);
+      if (!LoadMI || LoadMI->getOpcode() != Pattern.LoadOpcode ||
+          LoadMI->getParent() != MI.getParent())
+        continue;
+
+      int64_t Offset = LoadMI->getOperand(2).getImm();
+      if (!isInt<16>(Offset))
+        continue;
+
+      int Score = blockWeight(*MI.getParent()) * 4 - 1;
+      Out.push_back({Candidate::Movbe, &MI, LoadMI, nullptr, nullptr,
+                     Pattern.PseudoOpcode, Register(),
+                     LoadMI->getOperand(1).getReg(), Offset, 0, Score});
+      return;
+    }
+  }
+
+  static unsigned lowMaskWidth(uint64_t Mask) {
+    if (!Mask || !isPowerOf2_64(Mask + 1))
+      return 0;
+    return Log2_64(Mask + 1);
+  }
+
+  void collectBextr(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    if (MI.getOpcode() != BPF::AND_ri)
+      return;
+
+    int64_t MaskImm = MI.getOperand(2).getImm();
+    if (MaskImm <= 0)
+      return;
+
+    unsigned Len = lowMaskWidth(static_cast<uint64_t>(MaskImm));
+    if (!Len)
+      return;
+
+    Register ShiftReg = MI.getOperand(1).getReg();
+    if (!ShiftReg.isVirtual() || !MRI->hasOneNonDBGUse(ShiftReg))
+      return;
+
+    MachineInstr *ShiftMI = MRI->getVRegDef(ShiftReg);
+    if (!ShiftMI || ShiftMI->getOpcode() != BPF::SRL_ri ||
+        ShiftMI->getParent() != MI.getParent())
+      return;
+
+    int64_t Start = ShiftMI->getOperand(2).getImm();
+    if (Start <= 0 || Start >= 64 || Start + Len > 64)
+      return;
+
+    /*
+     * This first BEXTR form has to materialize the x86 control operand, so final
+     * native code is "mov control; bextr" instead of "shr; and".  That is not an
+     * instruction-count win, and the measured micro result is flat-to-negative.
+     * Keep the recognizer in place, but require a future form with an existing
+     * control register before selecting it by default.
+     */
+    int Score = -1;
+    Out.push_back({Candidate::Bextr, &MI, ShiftMI, nullptr, nullptr,
+                   BPF::BPF_KINSN_X86_BEXTRQ, ShiftMI->getOperand(1).getReg(),
+                   Register(), static_cast<int64_t>(Len),
+                   static_cast<unsigned>(Start), Score});
+  }
+
+  bool matchBmi1Operand(Register Reg, Register OtherReg, unsigned Opcode,
+                        int64_t Imm, Register &Src, MachineInstr *&AuxMI) const {
+    if (!Reg.isVirtual() || !MRI->hasOneNonDBGUse(Reg))
+      return false;
+
+    AuxMI = MRI->getVRegDef(Reg);
+    if (!AuxMI || AuxMI->getOpcode() != Opcode)
+      return false;
+
+    if (Opcode == BPF::ADD_ri) {
+      if (AuxMI->getOperand(2).getImm() != Imm)
+        return false;
+      Src = AuxMI->getOperand(1).getReg();
+    } else {
+      Src = AuxMI->getOperand(1).getReg();
+    }
+    return Src == OtherReg;
+  }
+
+  void collectBmi1(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    if (MI.getOpcode() != BPF::AND_rr)
+      return;
+
+    Register A = MI.getOperand(1).getReg();
+    Register B = MI.getOperand(2).getReg();
+    Register Src;
+    MachineInstr *AuxMI;
+    unsigned PseudoOpcode = 0;
+
+    if (matchBmi1Operand(A, B, BPF::ADD_ri, -1, Src, AuxMI) ||
+        matchBmi1Operand(B, A, BPF::ADD_ri, -1, Src, AuxMI)) {
+      PseudoOpcode = BPF::BPF_KINSN_X86_BLSRQ;
+    } else if (matchBmi1Operand(A, B, BPF::NEG_64, 0, Src, AuxMI) ||
+               matchBmi1Operand(B, A, BPF::NEG_64, 0, Src, AuxMI)) {
+      PseudoOpcode = BPF::BPF_KINSN_X86_BLSIQ;
+    } else {
+      return;
+    }
+
+    if (AuxMI->getParent() != MI.getParent())
+      return;
+
+    int Score = blockWeight(*MI.getParent()) * 3 - 1;
+    Out.push_back({Candidate::Bmi1, &MI, AuxMI, nullptr, nullptr, PseudoOpcode, Src,
+                   Register(), 0, 0, Score});
   }
 
   bool matchRotate(const MachineInstr &MI, const RotatePattern &Pattern,
@@ -172,7 +442,7 @@ private:
     return true;
   }
 
-  bool selectRotate(MachineInstr &MI) {
+  void collectRotate(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
     for (const RotatePattern &Pattern : RotatePatterns) {
       Register Src;
       unsigned Shift;
@@ -181,18 +451,158 @@ private:
       if (!matchRotate(MI, Pattern, Src, Shift, LeftShiftMI, RightShiftMI))
         continue;
 
-      MachineBasicBlock &MBB = *MI.getParent();
-      BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(Pattern.PseudoOpcode),
-              MI.getOperand(0).getReg())
-          .addReg(Src)
-          .addImm(Shift);
-      MI.eraseFromParent();
-      LeftShiftMI->eraseFromParent();
-      RightShiftMI->eraseFromParent();
-      ++NumRotateSelected;
+      int Score = blockWeight(*MI.getParent()) * 3 - 1;
+      Out.push_back({Candidate::Rotate, &MI, LeftShiftMI, RightShiftMI, nullptr,
+                     Pattern.PseudoOpcode, Src, Register(), 0, Shift, Score});
+      return;
+    }
+  }
+
+  bool matchShd(const MachineInstr &MI, const ShdPattern &Pattern,
+                Register &Lhs, Register &Src, unsigned &Shift,
+                MachineInstr *&LhsShiftMI, MachineInstr *&SrcShiftMI) const {
+    if (MI.getOpcode() != Pattern.OrOpcode)
+      return false;
+
+    Register A = MI.getOperand(1).getReg();
+    Register B = MI.getOperand(2).getReg();
+    if (!A.isVirtual() || !B.isVirtual())
+      return false;
+
+    LhsShiftMI = MRI->getVRegDef(A);
+    SrcShiftMI = MRI->getVRegDef(B);
+    if (!LhsShiftMI || !SrcShiftMI ||
+        LhsShiftMI->getOpcode() != Pattern.LhsShiftOpcode ||
+        SrcShiftMI->getOpcode() != Pattern.SrcShiftOpcode)
+      return false;
+    if (LhsShiftMI->getParent() != MI.getParent() ||
+        SrcShiftMI->getParent() != MI.getParent())
+      return false;
+    if (!MRI->hasOneNonDBGUse(A) || !MRI->hasOneNonDBGUse(B))
+      return false;
+
+    int64_t LhsImm = LhsShiftMI->getOperand(2).getImm();
+    int64_t SrcImm = SrcShiftMI->getOperand(2).getImm();
+    if (LhsImm <= 0 || SrcImm <= 0 ||
+        static_cast<unsigned>(LhsImm + SrcImm) != Pattern.Width)
+      return false;
+
+    Lhs = LhsShiftMI->getOperand(1).getReg();
+    Src = SrcShiftMI->getOperand(1).getReg();
+    if (Lhs == Src)
+      return false;
+
+    Shift = static_cast<unsigned>(LhsImm);
+    return true;
+  }
+
+  void collectShd(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    for (const ShdPattern &Pattern : ShdPatterns) {
+      Register Lhs, Src;
+      unsigned Shift;
+      MachineInstr *LhsShiftMI;
+      MachineInstr *SrcShiftMI;
+      if (!matchShd(MI, Pattern, Lhs, Src, Shift, LhsShiftMI, SrcShiftMI))
+        continue;
+
+      int Score = blockWeight(*MI.getParent()) * 3 - 1;
+      Out.push_back({Candidate::Shd, &MI, LhsShiftMI, SrcShiftMI, nullptr,
+                     Pattern.PseudoOpcode, Src, Lhs, 0, Shift, Score});
+      return;
+    }
+  }
+
+  static bool overlaps(const Candidate &C, const DenseSet<MachineInstr *> &Used) {
+    return Used.contains(C.Root) || (C.Left && Used.contains(C.Left)) ||
+           (C.Right && Used.contains(C.Right)) ||
+           (C.Extra && Used.contains(C.Extra));
+  }
+
+  static void markUsed(const Candidate &C, DenseSet<MachineInstr *> &Used) {
+    Used.insert(C.Root);
+    if (C.Left)
+      Used.insert(C.Left);
+    if (C.Right)
+      Used.insert(C.Right);
+    if (C.Extra)
+      Used.insert(C.Extra);
+  }
+
+  bool applyCandidate(const Candidate &C) {
+    MachineBasicBlock &MBB = *C.Root->getParent();
+    if (C.K == Candidate::Movbe16BE) {
+      MachineInstr *OrMI = C.Left;
+      MachineInstr *ShiftMI = C.Right;
+      Register ShiftReg = ShiftMI->getOperand(0).getReg();
+      Register LowReg = OrMI->getOperand(1).getReg() == ShiftReg
+                            ? OrMI->getOperand(2).getReg()
+                            : OrMI->getOperand(1).getReg();
+      MachineInstr *HighLoad = MRI->getVRegDef(ShiftMI->getOperand(1).getReg());
+      MachineInstr *LowLoad = MRI->getVRegDef(LowReg);
+      Register Zero = MRI->createVirtualRegister(&BPF::GPR32RegClass);
+      BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(BPF::MOV_ri_32),
+              Zero)
+          .addImm(0);
+      BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
+              C.Root->getOperand(0).getReg())
+          .addReg(Zero)
+          .addReg(C.Base)
+          .addImm(C.Offset);
+      C.Root->eraseFromParent();
+      OrMI->eraseFromParent();
+      ShiftMI->eraseFromParent();
+      HighLoad->eraseFromParent();
+      LowLoad->eraseFromParent();
+      ++NumMovbeSelected;
       return true;
     }
-    return false;
+
+    if (C.K == Candidate::Bextr) {
+      Register Control = MRI->createVirtualRegister(&BPF::GPRRegClass);
+      BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(BPF::MOV_ri),
+              Control)
+          .addImm((C.Offset << 8) | C.Shift);
+      BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
+              C.Root->getOperand(0).getReg())
+          .addReg(C.Src)
+          .addReg(Control);
+      C.Root->eraseFromParent();
+      if (C.Left)
+        C.Left->eraseFromParent();
+      ++NumBextrSelected;
+      return true;
+    }
+
+    MachineInstrBuilder Builder = BuildMI(
+        MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
+        C.Root->getOperand(0).getReg());
+    if (C.K == Candidate::Movbe) {
+      Builder.addReg(C.Base).addImm(C.Offset);
+    } else if (C.K == Candidate::Shd) {
+      Builder.addReg(C.Base).addReg(C.Src).addImm(C.Shift);
+    } else {
+      Builder.addReg(C.Src);
+    }
+    if (C.K == Candidate::Rotate)
+      Builder.addImm(C.Shift);
+    C.Root->eraseFromParent();
+    if (C.Left)
+      C.Left->eraseFromParent();
+    if (C.Right)
+      C.Right->eraseFromParent();
+    if (C.Extra)
+      C.Extra->eraseFromParent();
+    if (C.K == Candidate::Rotate)
+      ++NumRotateSelected;
+    else if (C.K == Candidate::Movbe)
+      ++NumMovbeSelected;
+    else if (C.K == Candidate::Bmi1)
+      ++NumBmi1Selected;
+    else if (C.K == Candidate::Shd)
+      ++NumShdSelected;
+    else
+      ++NumUnarySelected;
+    return true;
   }
 };
 
@@ -200,6 +610,10 @@ private:
 
 char BPFKinsnSelect::ID = 0;
 
-INITIALIZE_PASS(BPFKinsnSelect, DEBUG_TYPE, "BPF kinsn selector", false, false)
+INITIALIZE_PASS_BEGIN(BPFKinsnSelect, DEBUG_TYPE, "BPF kinsn selector", false,
+                      false)
+INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
+INITIALIZE_PASS_END(BPFKinsnSelect, DEBUG_TYPE, "BPF kinsn selector", false,
+                    false)
 
 FunctionPass *llvm::createBPFKinsnSelectPass() { return new BPFKinsnSelect(); }

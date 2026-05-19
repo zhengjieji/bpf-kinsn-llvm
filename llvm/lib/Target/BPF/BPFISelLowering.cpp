@@ -43,6 +43,8 @@ static cl::opt<unsigned> BPFMinimumJumpTableEntries(
     "bpf-min-jump-table-entries", cl::init(13), cl::Hidden,
     cl::desc("Set minimum number of entries to use a jump table on BPF"));
 
+extern cl::opt<bool> EnableBPFKinsnSelect;
+
 static void fail(const SDLoc &DL, SelectionDAG &DAG, const Twine &Msg,
                  SDValue Val = {}) {
   std::string Str;
@@ -129,7 +131,7 @@ BPFTargetLowering::BPFTargetLowering(const TargetMachine &TM,
     setOperationAction(ISD::SHL_PARTS, VT, Custom);
     setOperationAction(ISD::SRL_PARTS, VT, Custom);
     setOperationAction(ISD::SRA_PARTS, VT, Custom);
-    setOperationAction(ISD::CTPOP, VT, Expand);
+    setOperationAction(ISD::CTPOP, VT, EnableBPFKinsnSelect ? Legal : Expand);
     setOperationAction(ISD::CTTZ, VT, Expand);
     setOperationAction(ISD::CTLZ, VT, Expand);
     setOperationAction(ISD::CTTZ_ZERO_POISON, VT, Expand);
@@ -1050,6 +1052,44 @@ MachineBasicBlock *BPFTargetLowering::EmitInstrWithCustomInserterLDimm64(
   return emitLDImm64(nullptr, JTI);
 }
 
+static bool getKinsnSelectOpcodes(int CC, bool Value32, unsigned &CmovOpc,
+                                  bool &SwapCmp, bool &InvertValues) {
+  SwapCmp = false;
+  InvertValues = false;
+  switch (CC) {
+  case ISD::SETEQ:
+    CmovOpc = Value32 ? BPF::BPF_KINSN_X86_CMOVEL
+                      : BPF::BPF_KINSN_X86_CMOVEQ;
+    return true;
+  case ISD::SETNE:
+    CmovOpc = Value32 ? BPF::BPF_KINSN_X86_CMOVNEL
+                      : BPF::BPF_KINSN_X86_CMOVNEQ;
+    return true;
+  case ISD::SETULT:
+    CmovOpc = Value32 ? BPF::BPF_KINSN_X86_CMOVBL
+                      : BPF::BPF_KINSN_X86_CMOVBQ;
+    return true;
+  case ISD::SETUGT:
+    SwapCmp = true;
+    CmovOpc = Value32 ? BPF::BPF_KINSN_X86_CMOVBL
+                      : BPF::BPF_KINSN_X86_CMOVBQ;
+    return true;
+  case ISD::SETUGE:
+    InvertValues = true;
+    CmovOpc = Value32 ? BPF::BPF_KINSN_X86_CMOVBL
+                      : BPF::BPF_KINSN_X86_CMOVBQ;
+    return true;
+  case ISD::SETULE:
+    SwapCmp = true;
+    InvertValues = true;
+    CmovOpc = Value32 ? BPF::BPF_KINSN_X86_CMOVBL
+                      : BPF::BPF_KINSN_X86_CMOVBQ;
+    return true;
+  default:
+    return false;
+  }
+}
+
 MachineBasicBlock *
 BPFTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
                                                MachineBasicBlock *BB) const {
@@ -1060,16 +1100,15 @@ BPFTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
                        Opc == BPF::Select_64_32 ||
                        Opc == BPF::Select_32 ||
                        Opc == BPF::Select_32_64);
+  [[maybe_unused]] bool isSelectRIOp = (Opc == BPF::Select_Ri ||
+                                        Opc == BPF::Select_Ri_64_32 ||
+                                        Opc == BPF::Select_Ri_32 ||
+                                        Opc == BPF::Select_Ri_32_64);
 
   bool isMemcpyOp = Opc == BPF::MEMCPY;
   bool isLDimm64Op = Opc == BPF::LDIMM64;
 
 #ifndef NDEBUG
-  bool isSelectRIOp = (Opc == BPF::Select_Ri ||
-                       Opc == BPF::Select_Ri_64_32 ||
-                       Opc == BPF::Select_Ri_32 ||
-                       Opc == BPF::Select_Ri_32_64);
-
   if (!(isSelectRROp || isSelectRIOp || isMemcpyOp || isLDimm64Op))
     report_fatal_error("unhandled instruction type: " + Twine(Opc));
 #endif
@@ -1084,6 +1123,31 @@ BPFTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
                      Opc == BPF::Select_32_64 ||
                      Opc == BPF::Select_Ri_32 ||
                      Opc == BPF::Select_Ri_32_64);
+  bool is32BitValue = (Opc == BPF::Select_64_32 ||
+                       Opc == BPF::Select_32);
+
+  if (EnableBPFKinsnSelect && isSelectRROp &&
+      (!is32BitCmp || HasJmp32)) {
+    int CC = MI.getOperand(3).getImm();
+    unsigned CmpOpc = is32BitCmp ? BPF::BPF_KINSN_X86_CMPL
+                                 : BPF::BPF_KINSN_X86_CMPQ;
+    unsigned CmovOpc;
+    bool SwapCmp;
+    bool InvertValues;
+    if (getKinsnSelectOpcodes(CC, is32BitValue, CmovOpc, SwapCmp,
+                              InvertValues)) {
+      Register LHS = MI.getOperand(SwapCmp ? 2 : 1).getReg();
+      Register RHS = MI.getOperand(SwapCmp ? 1 : 2).getReg();
+      Register Old = MI.getOperand(InvertValues ? 4 : 5).getReg();
+      Register Src = MI.getOperand(InvertValues ? 5 : 4).getReg();
+      BuildMI(*BB, MI, DL, TII.get(CmpOpc)).addReg(LHS).addReg(RHS);
+      BuildMI(*BB, MI, DL, TII.get(CmovOpc), MI.getOperand(0).getReg())
+          .addReg(Old)
+          .addReg(Src);
+      MI.eraseFromParent();
+      return BB;
+    }
+  }
 
   // To "insert" a SELECT instruction, we actually have to insert the diamond
   // control-flow pattern.  The incoming instruction knows the destination vreg
