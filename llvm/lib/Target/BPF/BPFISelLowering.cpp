@@ -131,7 +131,12 @@ BPFTargetLowering::BPFTargetLowering(const TargetMachine &TM,
     setOperationAction(ISD::SHL_PARTS, VT, Custom);
     setOperationAction(ISD::SRL_PARTS, VT, Custom);
     setOperationAction(ISD::SRA_PARTS, VT, Custom);
-    setOperationAction(ISD::CTPOP, VT, EnableBPFKinsnSelect ? Legal : Expand);
+    setOperationAction(ISD::CTPOP, VT,
+                       EnableBPFKinsnSelect &&
+                               isBPFKinsnPolicyEnabled(
+                                   BPFKinsnPolicyKind::Popcnt)
+                           ? Legal
+                           : Expand);
     setOperationAction(ISD::CTTZ, VT, Expand);
     setOperationAction(ISD::CTLZ, VT, Expand);
     setOperationAction(ISD::CTTZ_ZERO_POISON, VT, Expand);
@@ -1126,7 +1131,8 @@ BPFTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
   bool is32BitValue = (Opc == BPF::Select_64_32 ||
                        Opc == BPF::Select_32);
 
-  if (EnableBPFKinsnSelect && isSelectRROp &&
+  if (EnableBPFKinsnSelect &&
+      isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Cmov) && isSelectRROp &&
       (!is32BitCmp || HasJmp32)) {
     int CC = MI.getOperand(3).getImm();
     unsigned CmpOpc = is32BitCmp ? BPF::BPF_KINSN_X86_CMPL

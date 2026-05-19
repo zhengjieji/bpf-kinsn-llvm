@@ -323,6 +323,7 @@ private:
   bool in16BitRange(int Num);
   bool eliminateRedundantMov();
   bool selectKinsnLeaPairs();
+  bool foldScaledIndexMemPseudos();
   bool adjustBranch();
   bool insertMissingCallerSavedSpills();
   bool removeMayGotoZero();
@@ -340,8 +341,12 @@ public:
 
     bool Changed;
     Changed = eliminateRedundantMov();
-    if (EnableBPFKinsnSelect)
+    if (EnableBPFKinsnSelect &&
+        isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::PreEmitLea))
       Changed = selectKinsnLeaPairs() || Changed;
+    if (EnableBPFKinsnSelect &&
+        isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::ScaledIndexMem))
+      Changed = foldScaledIndexMemPseudos() || Changed;
     if (SupportGotol)
       Changed = adjustBranch() || Changed;
     Changed |= insertMissingCallerSavedSpills();
@@ -406,6 +411,9 @@ bool BPFMIPreEmitPeephole::selectKinsnLeaPairs() {
   bool Changed = false;
 
   for (MachineBasicBlock &MBB : *MF) {
+    LivePhysRegs LiveOut(*TRI);
+    LiveOut.addLiveOuts(MBB);
+
     for (auto I = MBB.begin(); I != MBB.end();) {
       auto MovI = I++;
       MachineInstr &MovMI = *MovI;
@@ -423,6 +431,10 @@ bool BPFMIPreEmitPeephole::selectKinsnLeaPairs() {
 
       auto AfterAdd = AddI;
       ++AfterAdd;
+      MachineInstr *IndexMovMI = nullptr;
+      MachineInstr *IndexShiftMI = nullptr;
+      MachineInstr *FoldedImmMI = nullptr;
+      int64_t Disp = 0;
 
       if (AddMI.getOpcode() == (Is64 ? BPF::ADD_ri : BPF::ADD_ri_32)) {
         if (AddMI.getOperand(0).getReg() != Dst ||
@@ -447,21 +459,188 @@ bool BPFMIPreEmitPeephole::selectKinsnLeaPairs() {
         Register Index = AddMI.getOperand(2).getReg();
         if (Index == Dst)
           Index = Base;
+        Register RawIndex = Index;
+        unsigned Scale = 0;
+
+        auto RegOverlaps = [&](Register A, Register B) {
+          return A && B && TRI->regsOverlap(A, B);
+        };
+        auto RegUsedBeforeDef = [&](Register Reg) {
+          for (auto ScanI = AfterAdd; ScanI != MBB.end(); ++ScanI) {
+            bool HasDef = false;
+            for (const MachineOperand &MO : ScanI->operands()) {
+              if (!MO.isReg() || !RegOverlaps(MO.getReg(), Reg))
+                continue;
+              if (MO.isUse() && !MO.isUndef())
+                return true;
+              if (MO.isDef())
+                HasDef = true;
+            }
+            if (HasDef)
+              return false;
+          }
+          return false;
+        };
+        auto MatchScaledIndex = [&]() {
+          if (MovI == MBB.begin())
+            return false;
+          auto ShiftI = MovI;
+          --ShiftI;
+          MachineInstr &ShiftMI = *ShiftI;
+          if (ShiftMI.getOpcode() != (Is64 ? BPF::SLL_ri : BPF::SLL_ri_32))
+            return false;
+          if (!RegOverlaps(ShiftMI.getOperand(0).getReg(), Index) ||
+              !RegOverlaps(ShiftMI.getOperand(1).getReg(), Index))
+            return false;
+          int64_t Shift = ShiftMI.getOperand(2).getImm();
+          if (Shift < 1 || Shift > 3)
+            return false;
+          if (ShiftI == MBB.begin())
+            return false;
+          auto IndexMovI = ShiftI;
+          --IndexMovI;
+          MachineInstr &IndexMov = *IndexMovI;
+          if (IndexMov.getOpcode() != (Is64 ? BPF::MOV_rr : BPF::MOV_rr_32))
+            return false;
+          if (!RegOverlaps(IndexMov.getOperand(0).getReg(), Index))
+            return false;
+          if (LiveOut.contains(Index))
+            return false;
+          if (RegUsedBeforeDef(Index))
+            return false;
+          RawIndex = IndexMov.getOperand(1).getReg();
+          Scale = static_cast<unsigned>(Shift);
+          IndexMovMI = &IndexMov;
+          IndexShiftMI = &ShiftMI;
+          return true;
+        };
+        (void)MatchScaledIndex();
+
+        auto NextI = AfterAdd;
+        while (NextI != MBB.end() && NextI->isDebugInstr())
+          ++NextI;
+        if (NextI != MBB.end() &&
+            NextI->getOpcode() == (Is64 ? BPF::ADD_ri : BPF::ADD_ri_32) &&
+            NextI->getOperand(0).getReg() == Dst &&
+            NextI->getOperand(1).getReg() == Dst &&
+            isInt<32>(NextI->getOperand(2).getImm())) {
+          Disp = NextI->getOperand(2).getImm();
+          FoldedImmMI = &*NextI;
+        }
 
         BuildMI(MBB, AddI, AddMI.getDebugLoc(),
                 TII->get(Is64 ? BPF::BPF_KINSN_X86_LEAQ
                                : BPF::BPF_KINSN_X86_LEAL),
                 Dst)
             .addReg(Base)
-            .addReg(Index);
+            .addReg(RawIndex)
+            .addImm(Scale)
+            .addImm(Disp);
       } else {
         continue;
       }
 
+      auto Resume = FoldedImmMI ? std::next(FoldedImmMI->getIterator())
+                                : AfterAdd;
       MovMI.eraseFromParent();
       AddMI.eraseFromParent();
-      I = AfterAdd;
+      if (IndexShiftMI)
+        IndexShiftMI->eraseFromParent();
+      if (IndexMovMI)
+        IndexMovMI->eraseFromParent();
+      if (FoldedImmMI)
+        FoldedImmMI->eraseFromParent();
+      I = Resume;
       ++PreEmitLeaNum;
+      Changed = true;
+    }
+  }
+
+  return Changed;
+}
+
+bool BPFMIPreEmitPeephole::foldScaledIndexMemPseudos() {
+  bool Changed = false;
+
+  auto IsSibMemPseudo = [](unsigned Opcode) {
+    return Opcode == BPF::BPF_KINSN_X86_MOVZBL ||
+           Opcode == BPF::BPF_KINSN_X86_MOVZWL ||
+           Opcode == BPF::BPF_KINSN_X86_MOVL ||
+           Opcode == BPF::BPF_KINSN_X86_MOVQ;
+  };
+  auto RegOverlaps = [&](Register A, Register B) {
+    return A && B && TRI->regsOverlap(A, B);
+  };
+
+  for (MachineBasicBlock &MBB : *MF) {
+    LivePhysRegs LiveOut(*TRI);
+    LiveOut.addLiveOuts(MBB);
+
+    for (auto I = MBB.begin(); I != MBB.end();) {
+      MachineInstr &MovMI = *I++;
+      unsigned MovOpc = MovMI.getOpcode();
+      if (MovOpc != BPF::MOV_rr && MovOpc != BPF::MOV_rr_32)
+        continue;
+      if (I == MBB.end())
+        break;
+
+      MachineInstr &ShiftMI = *I;
+      bool Is64 = MovOpc == BPF::MOV_rr;
+      if (ShiftMI.getOpcode() != (Is64 ? BPF::SLL_ri : BPF::SLL_ri_32))
+        continue;
+
+      Register Index = MovMI.getOperand(0).getReg();
+      if (LiveOut.contains(Index))
+        continue;
+
+      if (!RegOverlaps(ShiftMI.getOperand(0).getReg(), Index) ||
+          !RegOverlaps(ShiftMI.getOperand(1).getReg(), Index))
+        continue;
+      int64_t Shift = ShiftMI.getOperand(2).getImm();
+      if (Shift < 1 || Shift > 3)
+        continue;
+
+      SmallVector<MachineInstr *, 8> Users;
+      bool CanFold = true;
+      for (auto ScanI = std::next(I); ScanI != MBB.end(); ++ScanI) {
+        MachineInstr &UseMI = *ScanI;
+        if (UseMI.isDebugInstr())
+          continue;
+
+        bool UsesIndex = false;
+        bool DefsIndex = false;
+        for (const MachineOperand &MO : UseMI.operands()) {
+          if (!MO.isReg() || !RegOverlaps(MO.getReg(), Index))
+            continue;
+          UsesIndex |= MO.isUse() && !MO.isUndef();
+          DefsIndex |= MO.isDef();
+        }
+        if (UsesIndex) {
+          if (!IsSibMemPseudo(UseMI.getOpcode()) ||
+              !RegOverlaps(UseMI.getOperand(2).getReg(), Index) ||
+              UseMI.getOperand(3).getImm() != 0 ||
+              RegOverlaps(UseMI.getOperand(0).getReg(),
+                          MovMI.getOperand(1).getReg())) {
+            CanFold = false;
+            break;
+          }
+          Users.push_back(&UseMI);
+        }
+        if (DefsIndex)
+          break;
+      }
+      if (!CanFold || Users.empty())
+        continue;
+
+      Register RawIndex = MovMI.getOperand(1).getReg();
+      for (MachineInstr *UseMI : Users) {
+        UseMI->getOperand(2).setReg(RawIndex);
+        UseMI->getOperand(3).setImm(Shift);
+      }
+      auto Resume = std::next(I);
+      ShiftMI.eraseFromParent();
+      MovMI.eraseFromParent();
+      I = Resume;
       Changed = true;
     }
   }

@@ -21,6 +21,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -29,7 +30,9 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
+#include <array>
 
 using namespace llvm;
 
@@ -38,9 +41,98 @@ using namespace llvm;
 cl::opt<bool>
     EnableBPFKinsnSelect("bpf-enable-kinsn-select", cl::Hidden, cl::init(false),
                          cl::desc("Enable BPF kinsn MachineInstr selection"));
-cl::opt<bool>
-    ForceBPFKinsnSelectAll("bpf-kinsn-force-all", cl::Hidden, cl::init(false),
-                           cl::desc("Select every legal BPF kinsn candidate, ignoring profitability"));
+static cl::list<std::string> BPFKinsnModeSpecs(
+    "bpf-kinsn-mode", cl::Hidden, cl::CommaSeparated,
+    cl::desc("Set kinsn selector policy as family=disable|cost|force; "
+             "repeat or comma-separate entries, with all=... supported"),
+    cl::value_desc("family=mode"));
+cl::opt<unsigned> BPFKinsnRotateAmortizationThreshold(
+    "bpf-kinsn-rotate-amortization-threshold", cl::Hidden, cl::init(4),
+    cl::desc("Minimum function-local rotate candidate count that amortizes rotate kinsn proof cost"));
+
+static constexpr unsigned NumBPFKinsnPolicyKinds =
+    static_cast<unsigned>(BPFKinsnPolicyKind::Count);
+static std::array<BPFKinsnPolicyMode, NumBPFKinsnPolicyKinds>
+    BPFKinsnPolicyModes;
+static bool BPFKinsnPolicyParsed = false;
+
+static BPFKinsnPolicyKind parseBPFKinsnPolicyKind(StringRef Name) {
+  if (Name == "unary")
+    return BPFKinsnPolicyKind::Unary;
+  if (Name == "wide-load")
+    return BPFKinsnPolicyKind::WideLoad;
+  if (Name == "movbe-be")
+    return BPFKinsnPolicyKind::MovbeBE;
+  if (Name == "movbe-load")
+    return BPFKinsnPolicyKind::MovbeLoad;
+  if (Name == "indexed-load")
+    return BPFKinsnPolicyKind::IndexedLoad;
+  if (Name == "bextr")
+    return BPFKinsnPolicyKind::Bextr;
+  if (Name == "bmi1")
+    return BPFKinsnPolicyKind::Bmi1;
+  if (Name == "rotate")
+    return BPFKinsnPolicyKind::Rotate;
+  if (Name == "shd")
+    return BPFKinsnPolicyKind::Shd;
+  if (Name == "cmov")
+    return BPFKinsnPolicyKind::Cmov;
+  if (Name == "popcnt")
+    return BPFKinsnPolicyKind::Popcnt;
+  if (Name == "preemit-lea")
+    return BPFKinsnPolicyKind::PreEmitLea;
+  if (Name == "scaled-index-mem")
+    return BPFKinsnPolicyKind::ScaledIndexMem;
+  report_fatal_error(Twine("unknown -bpf-kinsn-mode family: ") + Name);
+}
+
+static BPFKinsnPolicyMode parseBPFKinsnPolicyMode(StringRef Mode) {
+  if (Mode == "disable")
+    return BPFKinsnPolicyMode::Disable;
+  if (Mode == "cost")
+    return BPFKinsnPolicyMode::Cost;
+  if (Mode == "force")
+    return BPFKinsnPolicyMode::Force;
+  report_fatal_error(Twine("unknown -bpf-kinsn-mode value: ") + Mode);
+}
+
+static void parseBPFKinsnPolicyModes() {
+  if (BPFKinsnPolicyParsed)
+    return;
+  BPFKinsnPolicyModes.fill(BPFKinsnPolicyMode::Cost);
+  for (const std::string &RawSpec : BPFKinsnModeSpecs) {
+    StringRef Spec(RawSpec);
+    Spec = Spec.trim();
+    StringRef Family, ModeText;
+    std::tie(Family, ModeText) = Spec.split('=');
+    Family = Family.trim();
+    ModeText = ModeText.trim();
+    if (Family.empty() || ModeText.empty() || ModeText.contains('='))
+      report_fatal_error(Twine("invalid -bpf-kinsn-mode entry: ") + Spec);
+    BPFKinsnPolicyMode Mode = parseBPFKinsnPolicyMode(ModeText);
+    if (Family == "all") {
+      BPFKinsnPolicyModes.fill(Mode);
+      continue;
+    }
+    BPFKinsnPolicyModes[static_cast<unsigned>(
+        parseBPFKinsnPolicyKind(Family))] = Mode;
+  }
+  BPFKinsnPolicyParsed = true;
+}
+
+BPFKinsnPolicyMode
+llvm::getBPFKinsnPolicyMode(BPFKinsnPolicyKind Kind) {
+  parseBPFKinsnPolicyModes();
+  return BPFKinsnPolicyModes[static_cast<unsigned>(Kind)];
+}
+
+bool llvm::isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind Kind) {
+  return getBPFKinsnPolicyMode(Kind) != BPFKinsnPolicyMode::Disable;
+}
+
+bool llvm::isBPFKinsnPolicyForced(BPFKinsnPolicyKind Kind) {
+  return getBPFKinsnPolicyMode(Kind) == BPFKinsnPolicyMode::Force;
+}
 
 STATISTIC(NumUnarySelected, "Number of unary kinsn pseudos selected");
 STATISTIC(NumMovbeSelected, "Number of movbe kinsn pseudos selected");
@@ -174,6 +266,8 @@ public:
         collectCandidates(MI, Candidates, LocalSubprog);
     }
 
+    applyFunctionCosts(Candidates);
+
     llvm::stable_sort(Candidates, [](const Candidate &A, const Candidate &B) {
       return A.Score > B.Score;
     });
@@ -207,8 +301,38 @@ private:
     return Loop ? 4 + Loop->getLoopDepth() : 1;
   }
 
-  static int score(int DefaultScore) {
-    return ForceBPFKinsnSelectAll && DefaultScore <= 0 ? 1 : DefaultScore;
+  static int score(int DefaultScore, BPFKinsnPolicyKind Kind) {
+    return isBPFKinsnPolicyForced(Kind) && DefaultScore <= 0 ? 1
+                                                             : DefaultScore;
+  }
+
+  void applyFunctionCosts(SmallVectorImpl<Candidate> &Candidates) const {
+    if (getBPFKinsnPolicyMode(BPFKinsnPolicyKind::Rotate) !=
+        BPFKinsnPolicyMode::Cost)
+      return;
+
+    unsigned RotateCount = 0;
+    for (const Candidate &C : Candidates)
+      if (C.K == Candidate::Rotate)
+        ++RotateCount;
+
+    /*
+     * Immediate rotate uses a scratch/proof path.  A function with many rotates
+     * amortizes that fixed cost well, but one or two cold rotates can make the
+     * final JIT allocate a larger stack frame than the saved ALU instructions
+     * are worth.  This is a profitability policy, so keep it behind an llc flag
+     * for A/B runs; correctness constraints stay unconditional.
+     */
+    if (RotateCount >= BPFKinsnRotateAmortizationThreshold)
+      return;
+
+    for (Candidate &C : Candidates) {
+      if (C.K != Candidate::Rotate)
+        continue;
+      if (Loops && Loops->getLoopFor(C.Root->getParent()))
+        continue;
+      C.Score = -1;
+    }
   }
 
   void collectCandidates(MachineInstr &MI, SmallVectorImpl<Candidate> &Out,
@@ -217,18 +341,28 @@ private:
     // stack is combined with the caller, so keep local-subprog rewrites off
     // until the module proof stack contract is tightened.
     if (LocalSubprog) {
-      collectWideLoadLE(MI, Out, true);
+      if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::WideLoad))
+        collectWideLoadLE(MI, Out, true);
       return;
     }
-    collectWideLoadLE(MI, Out, false);
-    collectUnary(MI, Out);
-    collectMovbeBE(MI, Out);
-    collectMovbe(MI, Out);
-    collectIndexedLoad(MI, Out);
-    collectBextr(MI, Out);
-    collectBmi1(MI, Out);
-    collectRotate(MI, Out);
-    collectShd(MI, Out);
+    if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::WideLoad))
+      collectWideLoadLE(MI, Out, false);
+    if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Unary))
+      collectUnary(MI, Out);
+    if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::MovbeBE))
+      collectMovbeBE(MI, Out);
+    if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::MovbeLoad))
+      collectMovbe(MI, Out);
+    if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::IndexedLoad))
+      collectIndexedLoad(MI, Out);
+    if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Bextr))
+      collectBextr(MI, Out);
+    if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Bmi1))
+      collectBmi1(MI, Out);
+    if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Rotate))
+      collectRotate(MI, Out);
+    if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Shd))
+      collectShd(MI, Out);
   }
 
   void collectUnary(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
@@ -236,7 +370,8 @@ private:
       if (MI.getOpcode() != Pattern.Opcode)
         continue;
 
-      int Score = score(blockWeight(*MI.getParent()) - 2);
+      int Score =
+          score(blockWeight(*MI.getParent()) - 2, BPFKinsnPolicyKind::Unary);
       Out.push_back(
           {Candidate::Unary, &MI, nullptr, nullptr, nullptr, Pattern.PseudoOpcode,
            MI.getOperand(1).getReg(), Register(), 0, 0, Score});
@@ -551,10 +686,40 @@ private:
     if (!isInt<16>(Offset))
       return;
 
-    int Score = blockWeight(*MI.getParent()) * 3 - 1;
+    auto MatchScaledIndex = [&](Register Reg, Register &Index,
+                                unsigned &Scale,
+                                MachineInstr *&ScaleMI) -> bool {
+      if (!Reg.isVirtual() || !MRI->hasOneNonDBGUse(Reg))
+        return false;
+      MachineInstr *DefMI = MRI->getVRegDef(Reg);
+      if (!DefMI || DefMI->getParent() != MI.getParent() ||
+          DefMI->getOpcode() != BPF::SLL_ri)
+        return false;
+      int64_t Shift = DefMI->getOperand(2).getImm();
+      if (Shift < 1 || Shift > 3)
+        return false;
+      Index = DefMI->getOperand(1).getReg();
+      Scale = static_cast<unsigned>(Shift);
+      ScaleMI = DefMI;
+      return true;
+    };
+
+    Register Lhs = AddrMI->getOperand(1).getReg();
+    Register Rhs = AddrMI->getOperand(2).getReg();
+    Register Base = Lhs;
+    Register Index = Rhs;
+    unsigned Scale = 0;
+    MachineInstr *ScaleMI = nullptr;
+    if (MatchScaledIndex(Rhs, Index, Scale, ScaleMI)) {
+      Base = Lhs;
+    } else if (MatchScaledIndex(Lhs, Index, Scale, ScaleMI)) {
+      Base = Rhs;
+    }
+
+    int Score = blockWeight(*MI.getParent()) * (Scale ? 5 : 3) - 1;
     Candidate C{Candidate::IndexedLoad, &MI, AddrMI, nullptr, nullptr,
-                PseudoOpcode, AddrMI->getOperand(2).getReg(),
-                AddrMI->getOperand(1).getReg(), Offset, 0, Score};
+                PseudoOpcode, Index, Base, Offset, Scale, Score};
+    C.Right = ScaleMI;
     Out.push_back(std::move(C));
   }
 
@@ -596,7 +761,7 @@ private:
      * Keep the recognizer in place, but require a future form with an existing
      * control register before selecting it by default.
      */
-    int Score = score(-1);
+    int Score = score(-1, BPFKinsnPolicyKind::Bextr);
     Out.push_back({Candidate::Bextr, &MI, ShiftMI, nullptr, nullptr,
                    BPF::BPF_KINSN_X86_BEXTRQ, ShiftMI->getOperand(1).getReg(),
                    Register(), static_cast<int64_t>(Len),
@@ -841,6 +1006,8 @@ private:
       C.Root->eraseFromParent();
       if (C.Left)
         C.Left->eraseFromParent();
+      if (C.Right)
+        C.Right->eraseFromParent();
       ++NumIndexedLoadSelected;
       return true;
     }

@@ -37,6 +37,33 @@ InstructionSelector *createBPFInstructionSelector(const BPFTargetMachine &,
                                                   const BPFSubtarget &,
                                                   const BPFRegisterBankInfo &);
 
+enum class BPFKinsnPolicyKind : unsigned {
+  Unary,
+  WideLoad,
+  MovbeBE,
+  MovbeLoad,
+  IndexedLoad,
+  Bextr,
+  Bmi1,
+  Rotate,
+  Shd,
+  Cmov,
+  Popcnt,
+  PreEmitLea,
+  ScaledIndexMem,
+  Count,
+};
+
+enum class BPFKinsnPolicyMode : unsigned {
+  Disable,
+  Cost,
+  Force,
+};
+
+BPFKinsnPolicyMode getBPFKinsnPolicyMode(BPFKinsnPolicyKind Kind);
+bool isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind Kind);
+bool isBPFKinsnPolicyForced(BPFKinsnPolicyKind Kind);
+
 void initializeBPFAsmPrinterPass(PassRegistry &);
 void initializeBPFCheckAndAdjustIRPass(PassRegistry &);
 void initializeBPFKinsnSelectPass(PassRegistry &);
