@@ -38,13 +38,20 @@ using namespace llvm;
 cl::opt<bool>
     EnableBPFKinsnSelect("bpf-enable-kinsn-select", cl::Hidden, cl::init(false),
                          cl::desc("Enable BPF kinsn MachineInstr selection"));
+cl::opt<bool>
+    ForceBPFKinsnSelectAll("bpf-kinsn-force-all", cl::Hidden, cl::init(false),
+                           cl::desc("Select every legal BPF kinsn candidate, ignoring profitability"));
 
 STATISTIC(NumUnarySelected, "Number of unary kinsn pseudos selected");
 STATISTIC(NumMovbeSelected, "Number of movbe kinsn pseudos selected");
+STATISTIC(NumIndexedLoadSelected,
+          "Number of indexed load kinsn pseudos selected");
 STATISTIC(NumBextrSelected, "Number of BEXTR kinsn pseudos selected");
 STATISTIC(NumBmi1Selected, "Number of BMI1 kinsn pseudos selected");
 STATISTIC(NumRotateSelected, "Number of rotate kinsn pseudos selected");
 STATISTIC(NumShdSelected, "Number of SHLD/SHRD kinsn pseudos selected");
+STATISTIC(NumWideLoadSelected,
+          "Number of byte-ladder wide loads selected");
 STATISTIC(NumCandidatesSkipped,
           "Number of non-profitable or overlapping kinsn candidates skipped");
 
@@ -56,6 +63,12 @@ struct UnaryPattern {
 };
 
 constexpr UnaryPattern UnaryPatterns[] = {
+    {BPF::BSWAP16, BPF::BPF_KINSN_X86_ROLW},
+    {BPF::BE16, BPF::BPF_KINSN_X86_ROLW},
+    {BPF::LE16, BPF::BPF_KINSN_X86_ROLW},
+    {BPF::BSWAP32, BPF::BPF_KINSN_X86_BSWAPL},
+    {BPF::BE32, BPF::BPF_KINSN_X86_BSWAPL},
+    {BPF::LE32, BPF::BPF_KINSN_X86_BSWAPL},
     {BPF::BSWAP64, BPF::BPF_KINSN_X86_BSWAPQ},
     {BPF::BE64, BPF::BPF_KINSN_X86_BSWAPQ},
     {BPF::LE64, BPF::BPF_KINSN_X86_BSWAPQ},
@@ -108,7 +121,17 @@ constexpr ShdPattern ShdPatterns[] = {
 };
 
 struct Candidate {
-  enum Kind { Unary, Movbe, Movbe16BE, Bextr, Bmi1, Rotate, Shd } K;
+  enum Kind {
+    Unary,
+    WideLoadLE,
+    Movbe,
+    MovbeBE,
+    IndexedLoad,
+    Bextr,
+    Bmi1,
+    Rotate,
+    Shd
+  } K;
   MachineInstr *Root;
   MachineInstr *Left = nullptr;
   MachineInstr *Right = nullptr;
@@ -119,6 +142,7 @@ struct Candidate {
   int64_t Offset = 0;
   unsigned Shift = 0;
   int Score;
+  SmallVector<MachineInstr *, 8> Erase;
 };
 
 class BPFKinsnSelect final : public MachineFunctionPass {
@@ -136,18 +160,18 @@ public:
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override {
-    if (!EnableBPFKinsnSelect || skipFunction(MF.getFunction()) ||
-        isLocalSubprog(MF.getFunction()))
+    if (!EnableBPFKinsnSelect || skipFunction(MF.getFunction()))
       return false;
 
     TII = MF.getSubtarget<BPFSubtarget>().getInstrInfo();
     MRI = &MF.getRegInfo();
     Loops = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
+    bool LocalSubprog = isLocalSubprog(MF.getFunction());
 
     SmallVector<Candidate, 16> Candidates;
     for (MachineBasicBlock &MBB : MF) {
       for (MachineInstr &MI : MBB)
-        collectCandidates(MI, Candidates);
+        collectCandidates(MI, Candidates, LocalSubprog);
     }
 
     llvm::stable_sort(Candidates, [](const Candidate &A, const Candidate &B) {
@@ -183,10 +207,22 @@ private:
     return Loop ? 4 + Loop->getLoopDepth() : 1;
   }
 
-  void collectCandidates(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+  static int score(int DefaultScore) {
+    return ForceBPFKinsnSelectAll && DefaultScore <= 0 ? 1 : DefaultScore;
+  }
+
+  void collectCandidates(MachineInstr &MI, SmallVectorImpl<Candidate> &Out,
+                         bool LocalSubprog) {
+    collectWideLoadLE(MI, Out);
+    // Kinsn proof sequences may consume verifier stack. In bpf2bpf callees that
+    // stack is combined with the caller, so keep local-subprog rewrites limited
+    // to verifier-native BPF instructions.
+    if (LocalSubprog)
+      return;
     collectUnary(MI, Out);
-    collectMovbe16BE(MI, Out);
+    collectMovbeBE(MI, Out);
     collectMovbe(MI, Out);
+    collectIndexedLoad(MI, Out);
     collectBextr(MI, Out);
     collectBmi1(MI, Out);
     collectRotate(MI, Out);
@@ -198,7 +234,7 @@ private:
       if (MI.getOpcode() != Pattern.Opcode)
         continue;
 
-      int Score = blockWeight(*MI.getParent()) - 2;
+      int Score = score(blockWeight(*MI.getParent()) - 2);
       Out.push_back(
           {Candidate::Unary, &MI, nullptr, nullptr, nullptr, Pattern.PseudoOpcode,
            MI.getOperand(1).getReg(), Register(), 0, 0, Score});
@@ -210,78 +246,234 @@ private:
     return MI && MI->getOpcode() == BPF::LDB32;
   }
 
-  bool matchMovbe16LoadPair(Register HighReg, Register LowReg, Register &Base,
-                            int64_t &Offset, MachineInstr *&HighLoad,
-                            MachineInstr *&LowLoad) const {
-    if (!HighReg.isVirtual() || !LowReg.isVirtual() ||
-        !MRI->hasOneNonDBGUse(HighReg) || !MRI->hasOneNonDBGUse(LowReg))
+  struct WideLoadLane {
+    unsigned Byte;
+    MachineInstr *Load;
+  };
+
+  static void addUniqueErase(MachineInstr *MI,
+                             SmallVectorImpl<MachineInstr *> &Erase) {
+    if (!llvm::is_contained(Erase, MI))
+      Erase.push_back(MI);
+  }
+
+  bool matchWideLoadByte(Register Reg, MachineBasicBlock *MBB,
+                         bool Use64,
+                         MachineInstr *&Load,
+                         SmallVectorImpl<MachineInstr *> &Erase) const {
+    if (!Reg.isVirtual() || !MRI->hasOneNonDBGUse(Reg))
       return false;
 
-    HighLoad = MRI->getVRegDef(HighReg);
-    LowLoad = MRI->getVRegDef(LowReg);
-    if (!isByteLoad32(HighLoad) || !isByteLoad32(LowLoad) ||
-        HighLoad->getParent() != LowLoad->getParent())
+    MachineInstr *MI = MRI->getVRegDef(Reg);
+    if (!MI || MI->getParent() != MBB)
       return false;
 
-    Register HighBase = HighLoad->getOperand(1).getReg();
-    Register LowBase = LowLoad->getOperand(1).getReg();
-    int64_t HighOff = HighLoad->getOperand(2).getImm();
-    int64_t LowOff = LowLoad->getOperand(2).getImm();
-    if (HighBase != LowBase || LowOff != HighOff + 1 || !isInt<16>(HighOff))
+    if (MI->getOpcode() == BPF::LDB32) {
+      Load = MI;
+      addUniqueErase(MI, Erase);
+      return true;
+    }
+
+    if (!Use64 || MI->getOpcode() != BPF::SUBREG_TO_REG)
       return false;
 
-    Base = HighBase;
-    Offset = HighOff;
+    Register LoadReg = MI->getOperand(1).getReg();
+    if (!LoadReg.isVirtual() || !MRI->hasOneNonDBGUse(LoadReg))
+      return false;
+    MachineInstr *LoadMI = MRI->getVRegDef(LoadReg);
+    if (!isByteLoad32(LoadMI) || LoadMI->getParent() != MBB)
+      return false;
+
+    Load = LoadMI;
+    addUniqueErase(MI, Erase);
+    addUniqueErase(LoadMI, Erase);
     return true;
   }
 
-  void collectMovbe16BE(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
-    if (MI.getOpcode() != BPF::AND_ri_32 || MI.getOperand(2).getImm() != 0xffff)
-      return;
+  bool collectWideLoadLane(Register Reg, MachineBasicBlock *MBB,
+                           bool Use64,
+                           SmallVectorImpl<WideLoadLane> &Lanes,
+                           SmallVectorImpl<MachineInstr *> &Erase) const {
+    if (!Reg.isVirtual() || !MRI->hasOneNonDBGUse(Reg))
+      return false;
 
-    Register OrReg = MI.getOperand(1).getReg();
-    if (!OrReg.isVirtual() || !MRI->hasOneNonDBGUse(OrReg))
-      return;
+    MachineInstr *MI = MRI->getVRegDef(Reg);
+    if (!MI || MI->getParent() != MBB)
+      return false;
 
-    MachineInstr *OrMI = MRI->getVRegDef(OrReg);
-    if (!OrMI || OrMI->getOpcode() != BPF::OR_rr_32 ||
-        OrMI->getParent() != MI.getParent())
-      return;
+    MachineInstr *Load = nullptr;
+    if (matchWideLoadByte(Reg, MBB, Use64, Load, Erase)) {
+      Lanes.push_back({0, Load});
+      return true;
+    }
 
-    Register A = OrMI->getOperand(1).getReg();
-    Register B = OrMI->getOperand(2).getReg();
-    MachineInstr *ShiftMI = nullptr;
-    Register LowReg;
+    unsigned ShiftOpcode = Use64 ? BPF::SLL_ri : BPF::SLL_ri_32;
+    unsigned OrOpcode = Use64 ? BPF::OR_rr : BPF::OR_rr_32;
 
-    auto MatchShift = [&](Register Reg) -> bool {
-      if (!Reg.isVirtual() || !MRI->hasOneNonDBGUse(Reg))
+    if (MI->getOpcode() == ShiftOpcode) {
+      int64_t Shift = MI->getOperand(2).getImm();
+      if (Shift <= 0 || Shift > (Use64 ? 56 : 24) || Shift % 8)
         return false;
-      ShiftMI = MRI->getVRegDef(Reg);
-      return ShiftMI && ShiftMI->getOpcode() == BPF::SLL_ri_32 &&
-             ShiftMI->getParent() == MI.getParent() &&
-             ShiftMI->getOperand(2).getImm() == 8;
-    };
 
-    if (MatchShift(A)) {
-      LowReg = B;
-    } else if (MatchShift(B)) {
-      LowReg = A;
+      Register LoadReg = MI->getOperand(1).getReg();
+      if (!matchWideLoadByte(LoadReg, MBB, Use64, Load, Erase))
+        return false;
+
+      Lanes.push_back({static_cast<unsigned>(Shift / 8), Load});
+      addUniqueErase(MI, Erase);
+      return true;
+    }
+
+    if (MI->getOpcode() == OrOpcode) {
+      addUniqueErase(MI, Erase);
+      return collectWideLoadLane(MI->getOperand(1).getReg(), MBB, Use64, Lanes,
+                                 Erase) &&
+             collectWideLoadLane(MI->getOperand(2).getReg(), MBB, Use64, Lanes,
+                                 Erase);
+    }
+
+    return false;
+  }
+
+  bool validateWideLoadLanes(ArrayRef<WideLoadLane> Lanes, unsigned Width,
+                             bool BigEndian, Register &Base,
+                             int64_t &Offset) const {
+    if (Lanes.size() != Width)
+      return false;
+
+    bool Seen[8] = {};
+    bool HaveOffset = false;
+    for (const WideLoadLane &Lane : Lanes) {
+      if (Lane.Byte >= Width || Seen[Lane.Byte])
+        return false;
+      Seen[Lane.Byte] = true;
+
+      Register LaneBase = Lane.Load->getOperand(1).getReg();
+      int64_t LaneOff = Lane.Load->getOperand(2).getImm();
+      unsigned ByteOff = BigEndian ? Width - 1 - Lane.Byte : Lane.Byte;
+      int64_t RootOff = LaneOff - ByteOff;
+      if (!HaveOffset) {
+        Base = LaneBase;
+        Offset = RootOff;
+        HaveOffset = true;
+      } else if (Base != LaneBase || Offset != RootOff) {
+        return false;
+      }
+    }
+
+    for (unsigned I = 0; I < Width; ++I)
+      if (!Seen[I])
+        return false;
+
+    return isInt<16>(Offset) &&
+           (BigEndian || Offset % static_cast<int64_t>(Width) == 0);
+  }
+
+  bool matchWideLoadTree(MachineInstr &Root, MachineInstr *TreeRoot,
+                         unsigned Width, bool BigEndian, Register &Base,
+                         int64_t &Offset,
+                         SmallVectorImpl<MachineInstr *> &Erase) const {
+    SmallVector<WideLoadLane, 8> Lanes;
+    Erase.clear();
+
+    bool Use64 = TreeRoot->getOpcode() == BPF::OR_rr;
+    unsigned OrOpcode = Use64 ? BPF::OR_rr : BPF::OR_rr_32;
+    if (TreeRoot->getOpcode() == OrOpcode) {
+      if (!collectWideLoadLane(TreeRoot->getOperand(1).getReg(),
+                               Root.getParent(), Use64, Lanes, Erase) ||
+          !collectWideLoadLane(TreeRoot->getOperand(2).getReg(),
+                               Root.getParent(), Use64, Lanes, Erase))
+        return false;
     } else {
+      return false;
+    }
+
+    if (TreeRoot != &Root)
+      addUniqueErase(TreeRoot, Erase);
+    return validateWideLoadLanes(Lanes, Width, BigEndian, Base, Offset);
+  }
+
+  void collectWideLoadLE(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    MachineInstr *TreeRoot = &MI;
+    unsigned MaxWidth = 8;
+    if (MI.getOpcode() == BPF::AND_ri_32) {
+      int64_t Mask = MI.getOperand(2).getImm();
+      if (Mask != 0xffff)
+        return;
+      Register OrReg = MI.getOperand(1).getReg();
+      if (!OrReg.isVirtual() || !MRI->hasOneNonDBGUse(OrReg))
+        return;
+      TreeRoot = MRI->getVRegDef(OrReg);
+      if (!TreeRoot || TreeRoot->getParent() != MI.getParent())
+        return;
+      MaxWidth = 2;
+    } else if (MI.getOpcode() == BPF::OR_rr_32) {
+      MaxWidth = 4;
+    } else if (MI.getOpcode() != BPF::OR_rr) {
       return;
     }
 
-    Register Base;
-    int64_t Offset;
-    MachineInstr *HighLoad = nullptr;
-    MachineInstr *LowLoad = nullptr;
-    if (!matchMovbe16LoadPair(ShiftMI->getOperand(1).getReg(), LowReg, Base,
-                              Offset, HighLoad, LowLoad))
-      return;
+    for (unsigned Width : {MaxWidth, 4U, 2U}) {
+      if (Width > MaxWidth)
+        continue;
+      Register Base;
+      int64_t Offset = 0;
+      SmallVector<MachineInstr *, 8> Erase;
+      if (!matchWideLoadTree(MI, TreeRoot, Width, false, Base, Offset, Erase))
+        continue;
 
-    int Score = blockWeight(*MI.getParent()) * 4 - 1;
-    Out.push_back({Candidate::Movbe16BE, &MI, OrMI, ShiftMI, nullptr,
-                   BPF::BPF_KINSN_X86_MOVBE16, Register(), Base, Offset, 0,
-                   Score});
+      bool Use64 = TreeRoot->getOpcode() == BPF::OR_rr;
+      unsigned LoadOpcode = Width == 8 ? BPF::LDD
+                            : Width == 4 ? (Use64 ? BPF::LDW : BPF::LDW32)
+                                         : (Use64 ? BPF::LDH : BPF::LDH32);
+      int Score = blockWeight(*MI.getParent()) * static_cast<int>(Width + 2) - 1;
+      Candidate C{Candidate::WideLoadLE, &MI, nullptr, nullptr, nullptr,
+                  LoadOpcode, Register(), Base, Offset, Width, Score};
+      C.Erase = std::move(Erase);
+      Out.push_back(std::move(C));
+      return;
+    }
+  }
+
+  void collectMovbeBE(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    MachineInstr *TreeRoot = &MI;
+    unsigned MaxWidth = 8;
+    if (MI.getOpcode() == BPF::AND_ri_32) {
+      if (MI.getOperand(2).getImm() != 0xffff)
+        return;
+      Register OrReg = MI.getOperand(1).getReg();
+      if (!OrReg.isVirtual() || !MRI->hasOneNonDBGUse(OrReg))
+        return;
+      TreeRoot = MRI->getVRegDef(OrReg);
+      if (!TreeRoot || TreeRoot->getParent() != MI.getParent())
+        return;
+      MaxWidth = 2;
+    } else if (MI.getOpcode() == BPF::OR_rr_32) {
+      MaxWidth = 4;
+    } else if (MI.getOpcode() != BPF::OR_rr) {
+      return;
+    }
+
+    for (unsigned Width : {MaxWidth, 4U, 2U}) {
+      if (Width > MaxWidth)
+        continue;
+      Register Base;
+      int64_t Offset = 0;
+      SmallVector<MachineInstr *, 8> Erase;
+      if (!matchWideLoadTree(MI, TreeRoot, Width, true, Base, Offset, Erase))
+        continue;
+
+      unsigned PseudoOpcode =
+          Width == 8 ? BPF::BPF_KINSN_X86_MOVBE64
+                     : (Width == 4 ? BPF::BPF_KINSN_X86_MOVBE32
+                                   : BPF::BPF_KINSN_X86_MOVBE16);
+      int Score = blockWeight(*MI.getParent()) * static_cast<int>(Width + 3);
+      Candidate C{Candidate::MovbeBE, &MI, nullptr, nullptr, nullptr,
+                  PseudoOpcode, Register(), Base, Offset, Width, Score};
+      C.Erase = std::move(Erase);
+      Out.push_back(std::move(C));
+      return;
+    }
   }
 
   void collectMovbe(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
@@ -308,6 +500,49 @@ private:
                      LoadMI->getOperand(1).getReg(), Offset, 0, Score});
       return;
     }
+  }
+
+  static unsigned indexedLoadPseudo(unsigned Opcode) {
+    switch (Opcode) {
+    case BPF::LDB32:
+    case BPF::LDB:
+      return BPF::BPF_KINSN_X86_MOVZBL;
+    case BPF::LDH32:
+    case BPF::LDH:
+      return BPF::BPF_KINSN_X86_MOVZWL;
+    case BPF::LDW32:
+    case BPF::LDW:
+      return BPF::BPF_KINSN_X86_MOVL;
+    case BPF::LDD:
+      return BPF::BPF_KINSN_X86_MOVQ;
+    default:
+      return 0;
+    }
+  }
+
+  void collectIndexedLoad(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    unsigned PseudoOpcode = indexedLoadPseudo(MI.getOpcode());
+    if (!PseudoOpcode)
+      return;
+
+    Register AddrReg = MI.getOperand(1).getReg();
+    if (!AddrReg.isVirtual() || !MRI->hasOneNonDBGUse(AddrReg))
+      return;
+
+    MachineInstr *AddrMI = MRI->getVRegDef(AddrReg);
+    if (!AddrMI || AddrMI->getParent() != MI.getParent() ||
+        AddrMI->getOpcode() != BPF::ADD_rr)
+      return;
+
+    int64_t Offset = MI.getOperand(2).getImm();
+    if (!isInt<16>(Offset))
+      return;
+
+    int Score = blockWeight(*MI.getParent()) * 3 - 1;
+    Candidate C{Candidate::IndexedLoad, &MI, AddrMI, nullptr, nullptr,
+                PseudoOpcode, AddrMI->getOperand(2).getReg(),
+                AddrMI->getOperand(1).getReg(), Offset, 0, Score};
+    Out.push_back(std::move(C));
   }
 
   static unsigned lowMaskWidth(uint64_t Mask) {
@@ -348,7 +583,7 @@ private:
      * Keep the recognizer in place, but require a future form with an existing
      * control register before selecting it by default.
      */
-    int Score = -1;
+    int Score = score(-1);
     Out.push_back({Candidate::Bextr, &MI, ShiftMI, nullptr, nullptr,
                    BPF::BPF_KINSN_X86_BEXTRQ, ShiftMI->getOperand(1).getReg(),
                    Register(), static_cast<int64_t>(Len),
@@ -513,9 +748,14 @@ private:
   }
 
   static bool overlaps(const Candidate &C, const DenseSet<MachineInstr *> &Used) {
-    return Used.contains(C.Root) || (C.Left && Used.contains(C.Left)) ||
-           (C.Right && Used.contains(C.Right)) ||
-           (C.Extra && Used.contains(C.Extra));
+    if (Used.contains(C.Root) || (C.Left && Used.contains(C.Left)) ||
+        (C.Right && Used.contains(C.Right)) ||
+        (C.Extra && Used.contains(C.Extra)))
+      return true;
+    for (MachineInstr *MI : C.Erase)
+      if (Used.contains(MI))
+        return true;
+    return false;
   }
 
   static void markUsed(const Candidate &C, DenseSet<MachineInstr *> &Used) {
@@ -526,34 +766,59 @@ private:
       Used.insert(C.Right);
     if (C.Extra)
       Used.insert(C.Extra);
+    for (MachineInstr *MI : C.Erase)
+      Used.insert(MI);
   }
 
   bool applyCandidate(const Candidate &C) {
     MachineBasicBlock &MBB = *C.Root->getParent();
-    if (C.K == Candidate::Movbe16BE) {
-      MachineInstr *OrMI = C.Left;
-      MachineInstr *ShiftMI = C.Right;
-      Register ShiftReg = ShiftMI->getOperand(0).getReg();
-      Register LowReg = OrMI->getOperand(1).getReg() == ShiftReg
-                            ? OrMI->getOperand(2).getReg()
-                            : OrMI->getOperand(1).getReg();
-      MachineInstr *HighLoad = MRI->getVRegDef(ShiftMI->getOperand(1).getReg());
-      MachineInstr *LowLoad = MRI->getVRegDef(LowReg);
-      Register Zero = MRI->createVirtualRegister(&BPF::GPR32RegClass);
-      BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(BPF::MOV_ri_32),
-              Zero)
-          .addImm(0);
+    if (C.K == Candidate::MovbeBE) {
+      if (C.Shift == 2) {
+        Register Zero = MRI->createVirtualRegister(&BPF::GPR32RegClass);
+        BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(BPF::MOV_ri_32),
+                Zero)
+            .addImm(0);
+        BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
+                C.Root->getOperand(0).getReg())
+            .addReg(Zero)
+            .addReg(C.Base)
+            .addImm(C.Offset);
+      } else {
+        BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
+                C.Root->getOperand(0).getReg())
+            .addReg(C.Base)
+            .addImm(C.Offset);
+      }
+      C.Root->eraseFromParent();
+      for (MachineInstr *MI : C.Erase)
+        MI->eraseFromParent();
+      ++NumMovbeSelected;
+      return true;
+    }
+
+    if (C.K == Candidate::WideLoadLE) {
       BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
               C.Root->getOperand(0).getReg())
-          .addReg(Zero)
           .addReg(C.Base)
           .addImm(C.Offset);
       C.Root->eraseFromParent();
-      OrMI->eraseFromParent();
-      ShiftMI->eraseFromParent();
-      HighLoad->eraseFromParent();
-      LowLoad->eraseFromParent();
-      ++NumMovbeSelected;
+      for (MachineInstr *MI : C.Erase)
+        MI->eraseFromParent();
+      ++NumWideLoadSelected;
+      return true;
+    }
+
+    if (C.K == Candidate::IndexedLoad) {
+      BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
+              C.Root->getOperand(0).getReg())
+          .addReg(C.Base)
+          .addReg(C.Src)
+          .addImm(C.Shift)
+          .addImm(C.Offset);
+      C.Root->eraseFromParent();
+      if (C.Left)
+        C.Left->eraseFromParent();
+      ++NumIndexedLoadSelected;
       return true;
     }
 

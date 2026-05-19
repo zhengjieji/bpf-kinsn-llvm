@@ -40,6 +40,8 @@ using namespace llvm;
 static cl::opt<int> GotolAbsLowBound("gotol-abs-low-bound", cl::Hidden,
   cl::init(INT16_MAX >> 1), cl::desc("Specify gotol lower bound"));
 
+extern cl::opt<bool> EnableBPFKinsnSelect;
+
 STATISTIC(ZExtElemNum, "Number of zero extension shifts eliminated");
 
 namespace {
@@ -300,6 +302,7 @@ char BPFMIPeephole::ID = 0;
 FunctionPass* llvm::createBPFMIPeepholePass() { return new BPFMIPeephole(); }
 
 STATISTIC(RedundantMovElemNum, "Number of redundant moves eliminated");
+STATISTIC(PreEmitLeaNum, "Number of pre-emit MOV+ADD pairs selected as LEA");
 
 namespace {
 
@@ -319,6 +322,7 @@ private:
 
   bool in16BitRange(int Num);
   bool eliminateRedundantMov();
+  bool selectKinsnLeaPairs();
   bool adjustBranch();
   bool insertMissingCallerSavedSpills();
   bool removeMayGotoZero();
@@ -336,6 +340,8 @@ public:
 
     bool Changed;
     Changed = eliminateRedundantMov();
+    if (EnableBPFKinsnSelect)
+      Changed = selectKinsnLeaPairs() || Changed;
     if (SupportGotol)
       Changed = adjustBranch() || Changed;
     Changed |= insertMissingCallerSavedSpills();
@@ -394,6 +400,73 @@ bool BPFMIPreEmitPeephole::eliminateRedundantMov() {
   }
 
   return Eliminated;
+}
+
+bool BPFMIPreEmitPeephole::selectKinsnLeaPairs() {
+  bool Changed = false;
+
+  for (MachineBasicBlock &MBB : *MF) {
+    for (auto I = MBB.begin(); I != MBB.end();) {
+      auto MovI = I++;
+      MachineInstr &MovMI = *MovI;
+      unsigned MovOpc = MovMI.getOpcode();
+      if (MovOpc != BPF::MOV_rr && MovOpc != BPF::MOV_rr_32)
+        continue;
+      if (I == MBB.end())
+        break;
+
+      auto AddI = I;
+      MachineInstr &AddMI = *AddI;
+      bool Is64 = MovOpc == BPF::MOV_rr;
+      Register Dst = MovMI.getOperand(0).getReg();
+      Register Base = MovMI.getOperand(1).getReg();
+
+      auto AfterAdd = AddI;
+      ++AfterAdd;
+
+      if (AddMI.getOpcode() == (Is64 ? BPF::ADD_ri : BPF::ADD_ri_32)) {
+        if (AddMI.getOperand(0).getReg() != Dst ||
+            AddMI.getOperand(1).getReg() != Dst)
+          continue;
+
+        int64_t Imm = AddMI.getOperand(2).getImm();
+        if (!Imm || !isInt<32>(Imm))
+          continue;
+
+        BuildMI(MBB, AddI, AddMI.getDebugLoc(),
+                TII->get(Is64 ? BPF::BPF_KINSN_X86_LEAQI
+                               : BPF::BPF_KINSN_X86_LEALI),
+                Dst)
+            .addReg(Base)
+            .addImm(Imm);
+      } else if (AddMI.getOpcode() == (Is64 ? BPF::ADD_rr : BPF::ADD_rr_32)) {
+        if (AddMI.getOperand(0).getReg() != Dst ||
+            AddMI.getOperand(1).getReg() != Dst)
+          continue;
+
+        Register Index = AddMI.getOperand(2).getReg();
+        if (Index == Dst)
+          Index = Base;
+
+        BuildMI(MBB, AddI, AddMI.getDebugLoc(),
+                TII->get(Is64 ? BPF::BPF_KINSN_X86_LEAQ
+                               : BPF::BPF_KINSN_X86_LEAL),
+                Dst)
+            .addReg(Base)
+            .addReg(Index);
+      } else {
+        continue;
+      }
+
+      MovMI.eraseFromParent();
+      AddMI.eraseFromParent();
+      I = AfterAdd;
+      ++PreEmitLeaNum;
+      Changed = true;
+    }
+  }
+
+  return Changed;
 }
 
 bool BPFMIPreEmitPeephole::in16BitRange(int Num) {

@@ -850,9 +850,15 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
     def BPF_KINSN_X86_ROLQ
         : Pseudo<(outs GPR:$dst), (ins GPR:$src, i32imm:$shift),
                  "# BPF_KINSN_X86_ROLQ $dst, $src, $shift", []>;
+    def BPF_KINSN_X86_ROLW
+        : Pseudo<(outs GPR:$dst), (ins GPR:$src),
+                 "# BPF_KINSN_X86_ROLW $dst, $src", []>;
     def BPF_KINSN_X86_BSWAPQ
         : Pseudo<(outs GPR:$dst), (ins GPR:$src),
                  "# BPF_KINSN_X86_BSWAPQ $dst, $src", []>;
+    def BPF_KINSN_X86_BSWAPL
+        : Pseudo<(outs GPR:$dst), (ins GPR:$src),
+                 "# BPF_KINSN_X86_BSWAPL $dst, $src", []>;
   }
   def BPF_KINSN_X86_RORXL
       : Pseudo<(outs GPR32:$dst), (ins GPR32:$src, i32imm:$shift),
@@ -872,6 +878,28 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
   def BPF_KINSN_X86_MOVBE64
       : Pseudo<(outs GPR:$dst), (ins MEMri:$addr),
                "# BPF_KINSN_X86_MOVBE64 $dst, $addr", []>;
+  let Constraints = "@earlyclobber $dst" in {
+    def BPF_KINSN_X86_MOVZBL
+        : Pseudo<(outs GPR:$dst),
+                 (ins GPR:$base, GPR:$index, i32imm:$scale, i32imm:$off),
+                 "# BPF_KINSN_X86_MOVZBL $dst, $base, $index, $scale, $off",
+                 []>;
+    def BPF_KINSN_X86_MOVZWL
+        : Pseudo<(outs GPR:$dst),
+                 (ins GPR:$base, GPR:$index, i32imm:$scale, i32imm:$off),
+                 "# BPF_KINSN_X86_MOVZWL $dst, $base, $index, $scale, $off",
+                 []>;
+    def BPF_KINSN_X86_MOVL
+        : Pseudo<(outs GPR:$dst),
+                 (ins GPR:$base, GPR:$index, i32imm:$scale, i32imm:$off),
+                 "# BPF_KINSN_X86_MOVL $dst, $base, $index, $scale, $off",
+                 []>;
+    def BPF_KINSN_X86_MOVQ
+        : Pseudo<(outs GPR:$dst),
+                 (ins GPR:$base, GPR:$index, i32imm:$scale, i32imm:$off),
+                 "# BPF_KINSN_X86_MOVQ $dst, $base, $index, $scale, $off",
+                 []>;
+  }
   def BPF_KINSN_X86_BEXTRQ
       : Pseudo<(outs GPR:$dst), (ins GPR:$src, GPR:$ctl),
                "# BPF_KINSN_X86_BEXTRQ $dst, $src, $ctl", []>;
@@ -881,6 +909,18 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
   def BPF_KINSN_X86_BLSRQ
       : Pseudo<(outs GPR:$dst), (ins GPR:$src),
                "# BPF_KINSN_X86_BLSRQ $dst, $src", []>;
+  def BPF_KINSN_X86_LEAQ
+      : Pseudo<(outs GPR:$dst), (ins GPR:$base, GPR:$index),
+               "# BPF_KINSN_X86_LEAQ $dst, $base, $index", []>;
+  def BPF_KINSN_X86_LEAL
+      : Pseudo<(outs GPR32:$dst), (ins GPR32:$base, GPR32:$index),
+               "# BPF_KINSN_X86_LEAL $dst, $base, $index", []>;
+  def BPF_KINSN_X86_LEAQI
+      : Pseudo<(outs GPR:$dst), (ins GPR:$base, i64imm:$disp),
+               "# BPF_KINSN_X86_LEAQI $dst, $base, $disp", []>;
+  def BPF_KINSN_X86_LEALI
+      : Pseudo<(outs GPR32:$dst), (ins GPR32:$base, i32imm:$disp),
+               "# BPF_KINSN_X86_LEALI $dst, $base, $disp", []>;
   def BPF_KINSN_X86_CMPL
       : Pseudo<(outs), (ins GPR32:$lhs, GPR32:$rhs),
                "# BPF_KINSN_X86_CMPL $lhs, $rhs", []>;
