@@ -429,9 +429,9 @@ private:
           VerifierNative ? (Width == 8 ? BPF::LDD
                             : Width == 4 ? BPF::LDW
                                          : BPF::LDH)
-                         : (Width == 8 ? BPF::BPF_KINSN_X86_MOVQ
-                            : Width == 4 ? BPF::BPF_KINSN_X86_MOVL
-                                         : BPF::BPF_KINSN_X86_MOVZWL);
+                         : (Width == 8 ? BPF::BPF_KINSN_X86_MOVQ_MEM
+                            : Width == 4 ? BPF::BPF_KINSN_X86_MOVL_MEM
+                                         : BPF::BPF_KINSN_X86_MOVZWL_MEM);
       int Score = blockWeight(*MI.getParent()) * static_cast<int>(Width + 2) - 1;
       Candidate C{Candidate::WideLoadLE, &MI, nullptr, nullptr, nullptr,
                   LoadOpcode, Register(), Base, Offset, Width, Score};
@@ -524,6 +524,13 @@ private:
     default:
       return 0;
     }
+  }
+
+  static bool isDirectMovLoadPseudo(unsigned Opcode) {
+    return Opcode == BPF::BPF_KINSN_X86_MOVZBL_MEM ||
+           Opcode == BPF::BPF_KINSN_X86_MOVZWL_MEM ||
+           Opcode == BPF::BPF_KINSN_X86_MOVL_MEM ||
+           Opcode == BPF::BPF_KINSN_X86_MOVQ_MEM;
   }
 
   void collectIndexedLoad(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
@@ -804,13 +811,12 @@ private:
 
     if (C.K == Candidate::WideLoadLE) {
       if (C.PseudoOpcode == BPF::LDD || C.PseudoOpcode == BPF::LDW ||
-          C.PseudoOpcode == BPF::LDH) {
+          C.PseudoOpcode == BPF::LDH || isDirectMovLoadPseudo(C.PseudoOpcode)) {
         BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
                 C.Root->getOperand(0).getReg())
             .addReg(C.Base)
             .addImm(C.Offset);
       } else {
-        // Scale 4 is an LLVM-only no-index marker; AsmPrinter emits X86_FORM_MEM.
         BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
                 C.Root->getOperand(0).getReg())
             .addReg(C.Base)

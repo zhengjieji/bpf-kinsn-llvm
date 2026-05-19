@@ -878,6 +878,18 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
   def BPF_KINSN_X86_MOVBE64
       : Pseudo<(outs GPR:$dst), (ins MEMri:$addr),
                "# BPF_KINSN_X86_MOVBE64 $dst, $addr", []>;
+  def BPF_KINSN_X86_MOVZBL_MEM
+      : Pseudo<(outs GPR:$dst), (ins GPR:$base, i32imm:$off),
+               "# BPF_KINSN_X86_MOVZBL_MEM $dst, $base, $off", []>;
+  def BPF_KINSN_X86_MOVZWL_MEM
+      : Pseudo<(outs GPR:$dst), (ins GPR:$base, i32imm:$off),
+               "# BPF_KINSN_X86_MOVZWL_MEM $dst, $base, $off", []>;
+  def BPF_KINSN_X86_MOVL_MEM
+      : Pseudo<(outs GPR:$dst), (ins GPR:$base, i32imm:$off),
+               "# BPF_KINSN_X86_MOVL_MEM $dst, $base, $off", []>;
+  def BPF_KINSN_X86_MOVQ_MEM
+      : Pseudo<(outs GPR:$dst), (ins GPR:$base, i32imm:$off),
+               "# BPF_KINSN_X86_MOVQ_MEM $dst, $base, $off", []>;
   let Constraints = "@earlyclobber $dst" in {
     def BPF_KINSN_X86_MOVZBL
         : Pseudo<(outs GPR:$dst),

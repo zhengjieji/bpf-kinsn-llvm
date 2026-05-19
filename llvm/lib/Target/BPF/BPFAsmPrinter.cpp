@@ -143,13 +143,8 @@ uint64_t packX86SibPayload(Register Dst, Register Base, Register Index,
          (static_cast<uint64_t>(static_cast<uint16_t>(Offset)) << 20);
 }
 
-uint64_t packX86MovLoadPayload(const MachineInstr *MI) {
-  constexpr int64_t NoIndexScale = 4;
+uint64_t packX86MovSibPayload(const MachineInstr *MI) {
   int64_t Scale = MI->getOperand(3).getImm();
-  if (Scale == NoIndexScale)
-    return packX86MemPayload(MI->getOperand(0).getReg(),
-                             MI->getOperand(1).getReg(),
-                             MI->getOperand(4).getImm());
   return packX86SibPayload(MI->getOperand(0).getReg(),
                            MI->getOperand(1).getReg(),
                            MI->getOperand(2).getReg(), Scale,
@@ -269,50 +264,120 @@ bool BPFAsmPrinter::doFinalization(Module &M) {
   return AsmPrinter::doFinalization(M);
 }
 
-bool BPFAsmPrinter::functionNeedsKinsnScratch() const {
-  for (const MachineBasicBlock &MBB : *MF)
-    for (const MachineInstr &MI : MBB)
-      switch (MI.getOpcode()) {
-      case BPF::BPF_KINSN_X86_ROLQ:
-      case BPF::BPF_KINSN_X86_ROLW:
-      case BPF::BPF_KINSN_X86_RORXL:
-      case BPF::BPF_KINSN_X86_BSWAPQ:
-      case BPF::BPF_KINSN_X86_BSWAPL:
-      case BPF::BPF_KINSN_X86_POPCNTQ:
-      case BPF::BPF_KINSN_X86_MOVBE16:
-      case BPF::BPF_KINSN_X86_MOVBE32:
-      case BPF::BPF_KINSN_X86_MOVBE64:
-        return true;
-      /*
-       * MOVZBL/MOVZWL/MOVL/MOVQ load pseudos are intentionally absent here.
-       * LLVM emits only BPF-register memory operands for them, and their
-       * early-clobber constraint keeps SIB destinations away from address regs,
-       * so the module proof takes its no-scratch verifier-native fast paths.
-       */
-      case BPF::BPF_KINSN_X86_BEXTRQ:
-      case BPF::BPF_KINSN_X86_BLSIQ:
-      case BPF::BPF_KINSN_X86_BLSRQ:
-      case BPF::BPF_KINSN_X86_CMPL:
-      case BPF::BPF_KINSN_X86_CMPQ:
-      case BPF::BPF_KINSN_X86_SHLDL:
-      case BPF::BPF_KINSN_X86_SHLDQ:
-      case BPF::BPF_KINSN_X86_SHRDL:
-      case BPF::BPF_KINSN_X86_SHRDQ:
-      case BPF::BPF_KINSN_X86_CMOVEL:
-      case BPF::BPF_KINSN_X86_CMOVEQ:
-      case BPF::BPF_KINSN_X86_CMOVNEL:
-      case BPF::BPF_KINSN_X86_CMOVNEQ:
-      case BPF::BPF_KINSN_X86_CMOVBL:
-      case BPF::BPF_KINSN_X86_CMOVBQ:
-        return true;
-      default:
-        break;
-      }
-  return false;
+namespace {
+
+constexpr unsigned ScratchR6 = 1U << 0;
+constexpr unsigned ScratchR7 = 1U << 1;
+constexpr unsigned ScratchR8 = 1U << 2;
+constexpr unsigned ScratchAll = ScratchR6 | ScratchR7 | ScratchR8;
+
+static bool isKinsnScratchPhysReg(Register Reg) {
+  return Reg == BPF::R6 || Reg == BPF::W6 || Reg == BPF::R7 ||
+         Reg == BPF::W7 || Reg == BPF::R8 || Reg == BPF::W8;
 }
 
-void BPFAsmPrinter::emitScratchInit() {
-  for (Register Reg : {BPF::R6, BPF::R7, BPF::R8}) {
+static unsigned scratchBitForBPFRegNo(unsigned RegNo) {
+  switch (RegNo) {
+  case 6:
+    return ScratchR6;
+  case 7:
+    return ScratchR7;
+  case 8:
+    return ScratchR8;
+  default:
+    return 0;
+  }
+}
+
+static unsigned directMovbe16ScratchMask(const MachineInstr &MI) {
+  unsigned Dst = getBPFRegNo(MI.getOperand(0).getReg());
+  unsigned Base = getBPFRegNo(MI.getOperand(2).getReg());
+  unsigned Mask = 0;
+  unsigned Count = 0;
+
+  for (unsigned RegNo : {6U, 7U, 8U}) {
+    if (RegNo == Dst || RegNo == Base)
+      continue;
+    Mask |= scratchBitForBPFRegNo(RegNo);
+    if (++Count == 2)
+      return Mask;
+  }
+  return ScratchAll;
+}
+
+static unsigned rotateScratchMask(const MachineInstr &MI) {
+  unsigned Dst = getBPFRegNo(MI.getOperand(0).getReg());
+  unsigned Src = getBPFRegNo(MI.getOperand(1).getReg());
+
+  for (unsigned RegNo : {6U, 7U, 8U})
+    if (RegNo != Dst && RegNo != Src)
+      return scratchBitForBPFRegNo(RegNo);
+  return ScratchAll;
+}
+
+static unsigned kinsnScratchMaskForMI(const MachineInstr &MI) {
+  switch (MI.getOpcode()) {
+  case BPF::BPF_KINSN_X86_BSWAPQ:
+  case BPF::BPF_KINSN_X86_BSWAPL:
+    return ScratchR6;
+  case BPF::BPF_KINSN_X86_ROLQ:
+  case BPF::BPF_KINSN_X86_RORXL:
+    return rotateScratchMask(MI);
+  case BPF::BPF_KINSN_X86_ROLW:
+    return 0;
+  case BPF::BPF_KINSN_X86_BLSIQ:
+  case BPF::BPF_KINSN_X86_BLSRQ:
+  case BPF::BPF_KINSN_X86_SHLDL:
+  case BPF::BPF_KINSN_X86_SHLDQ:
+  case BPF::BPF_KINSN_X86_SHRDL:
+  case BPF::BPF_KINSN_X86_SHRDQ:
+    return ScratchR6 | ScratchR7;
+  case BPF::BPF_KINSN_X86_POPCNTQ:
+    if (!isKinsnScratchPhysReg(MI.getOperand(0).getReg()) &&
+        !isKinsnScratchPhysReg(MI.getOperand(1).getReg()))
+      return ScratchR6 | ScratchR7;
+    return ScratchAll;
+  case BPF::BPF_KINSN_X86_MOVBE16:
+    return directMovbe16ScratchMask(MI);
+  case BPF::BPF_KINSN_X86_BEXTRQ:
+  case BPF::BPF_KINSN_X86_CMPL:
+  case BPF::BPF_KINSN_X86_CMPQ:
+  case BPF::BPF_KINSN_X86_CMOVEL:
+  case BPF::BPF_KINSN_X86_CMOVEQ:
+  case BPF::BPF_KINSN_X86_CMOVNEL:
+  case BPF::BPF_KINSN_X86_CMOVNEQ:
+  case BPF::BPF_KINSN_X86_CMOVBL:
+  case BPF::BPF_KINSN_X86_CMOVBQ:
+    return ScratchAll;
+  default:
+    return 0;
+  }
+}
+
+} // namespace
+
+unsigned BPFAsmPrinter::functionKinsnScratchMask() const {
+  unsigned Mask = 0;
+  for (const MachineBasicBlock &MBB : *MF)
+    for (const MachineInstr &MI : MBB)
+      Mask |= kinsnScratchMaskForMI(MI);
+
+  /*
+   * MOV-load and direct MOVBE32/64 pseudos are intentionally absent here.
+   * LLVM emits only BPF-register memory operands for them.  Direct MEM pseudos
+   * need no scratch, MOVBE32/64 proof lowers to LDX+BSWAP, and SIB pseudos keep
+   * dst away from address regs through their early-clobber constraint, so module
+   * proof takes no-scratch fast paths.
+   */
+  return Mask;
+}
+
+void BPFAsmPrinter::emitScratchInit(unsigned Mask) {
+  const std::pair<unsigned, Register> ScratchRegs[] = {
+      {ScratchR6, BPF::R6}, {ScratchR7, BPF::R7}, {ScratchR8, BPF::R8}};
+  for (auto [Bit, Reg] : ScratchRegs) {
+    if (!(Mask & Bit))
+      continue;
     MCInst Init;
     Init.setOpcode(BPF::MOV_ri);
     Init.addOperand(MCOperand::createReg(Reg));
@@ -323,8 +388,8 @@ void BPFAsmPrinter::emitScratchInit() {
 
 void BPFAsmPrinter::emitFunctionBodyStart() {
   AsmPrinter::emitFunctionBodyStart();
-  if (functionNeedsKinsnScratch())
-    emitScratchInit();
+  if (unsigned Mask = functionKinsnScratchMask())
+    emitScratchInit(Mask);
 }
 
 void BPFAsmPrinter::printOperand(const MachineInstr *MI, int OpNum,
@@ -470,17 +535,41 @@ bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
                                     MI->getOperand(2).getImm()),
                   "bpf_x86_movbe64");
     return true;
+  case BPF::BPF_KINSN_X86_MOVZBL_MEM:
+    emitKinsnPair(packX86MemPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(1).getReg(),
+                                    MI->getOperand(2).getImm()),
+                  "bpf_x86_movzbl");
+    return true;
+  case BPF::BPF_KINSN_X86_MOVZWL_MEM:
+    emitKinsnPair(packX86MemPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(1).getReg(),
+                                    MI->getOperand(2).getImm()),
+                  "bpf_x86_movzwl");
+    return true;
+  case BPF::BPF_KINSN_X86_MOVL_MEM:
+    emitKinsnPair(packX86MemPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(1).getReg(),
+                                    MI->getOperand(2).getImm()),
+                  "bpf_x86_movl");
+    return true;
+  case BPF::BPF_KINSN_X86_MOVQ_MEM:
+    emitKinsnPair(packX86MemPayload(MI->getOperand(0).getReg(),
+                                    MI->getOperand(1).getReg(),
+                                    MI->getOperand(2).getImm()),
+                  "bpf_x86_movq");
+    return true;
   case BPF::BPF_KINSN_X86_MOVZBL:
-    emitKinsnPair(packX86MovLoadPayload(MI), "bpf_x86_movzbl");
+    emitKinsnPair(packX86MovSibPayload(MI), "bpf_x86_movzbl");
     return true;
   case BPF::BPF_KINSN_X86_MOVZWL:
-    emitKinsnPair(packX86MovLoadPayload(MI), "bpf_x86_movzwl");
+    emitKinsnPair(packX86MovSibPayload(MI), "bpf_x86_movzwl");
     return true;
   case BPF::BPF_KINSN_X86_MOVL:
-    emitKinsnPair(packX86MovLoadPayload(MI), "bpf_x86_movl");
+    emitKinsnPair(packX86MovSibPayload(MI), "bpf_x86_movl");
     return true;
   case BPF::BPF_KINSN_X86_MOVQ:
-    emitKinsnPair(packX86MovLoadPayload(MI), "bpf_x86_movq");
+    emitKinsnPair(packX86MovSibPayload(MI), "bpf_x86_movq");
     return true;
   case BPF::BPF_KINSN_X86_BEXTRQ:
     emitKinsnPair(packX86PlainRRRPayload(MI->getOperand(0).getReg(),

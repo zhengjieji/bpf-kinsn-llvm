@@ -44,8 +44,8 @@ private:
   bool SawTrapCall = false;
 
   const BPFTargetMachine &getBTM() const;
-  bool functionNeedsKinsnScratch() const;
-  void emitScratchInit();
+  unsigned functionKinsnScratchMask() const;
+  void emitScratchInit(unsigned Mask);
   void emitKinsnPair(uint64_t Payload, StringRef Callee);
   bool emitKinsnPseudo(const MachineInstr *MI);
 };
