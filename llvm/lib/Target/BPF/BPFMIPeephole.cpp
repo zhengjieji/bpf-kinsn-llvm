@@ -306,6 +306,54 @@ STATISTIC(PreEmitLeaNum, "Number of pre-emit MOV+ADD pairs selected as LEA");
 
 namespace {
 
+struct DeadScaledIndexProducer {
+  MachineInstr *Mov;
+  MachineInstr *Shift;
+  Register Index;
+  Register RawIndex;
+  unsigned Scale;
+};
+
+static bool regsOverlap(const TargetRegisterInfo *TRI, Register A,
+                        Register B) {
+  return A && B && TRI->regsOverlap(A, B);
+}
+
+static bool regUsedBeforeDef(const TargetRegisterInfo *TRI,
+                             MachineBasicBlock &MBB,
+                             MachineBasicBlock::iterator From,
+                             Register Reg) {
+  for (auto ScanI = From; ScanI != MBB.end(); ++ScanI) {
+    if (ScanI->readsRegister(Reg, TRI))
+      return true;
+    if (ScanI->modifiesRegister(Reg, TRI))
+      return false;
+  }
+  return false;
+}
+
+static bool matchDeadScaledIndexProducer(const TargetRegisterInfo *TRI,
+                                         MachineInstr &MovMI,
+                                         MachineInstr &ShiftMI, bool Is64,
+                                         const LivePhysRegs &LiveOut,
+                                         DeadScaledIndexProducer &Producer) {
+  if (MovMI.getOpcode() != (Is64 ? BPF::MOV_rr : BPF::MOV_rr_32) ||
+      ShiftMI.getOpcode() != (Is64 ? BPF::SLL_ri : BPF::SLL_ri_32))
+    return false;
+
+  Register Index = MovMI.getOperand(0).getReg();
+  int64_t Shift = ShiftMI.getOperand(2).getImm();
+  if (LiveOut.contains(Index) ||
+      !regsOverlap(TRI, ShiftMI.getOperand(0).getReg(), Index) ||
+      !regsOverlap(TRI, ShiftMI.getOperand(1).getReg(), Index) ||
+      Shift < 1 || Shift > 3)
+    return false;
+
+  Producer = {&MovMI, &ShiftMI, Index, MovMI.getOperand(1).getReg(),
+              static_cast<unsigned>(Shift)};
+  return true;
+}
+
 struct BPFMIPreEmitPeephole : public MachineFunctionPass {
 
   static char ID;
@@ -461,60 +509,24 @@ bool BPFMIPreEmitPeephole::selectKinsnLeaPairs() {
           Index = Base;
         Register RawIndex = Index;
         unsigned Scale = 0;
-
-        auto RegOverlaps = [&](Register A, Register B) {
-          return A && B && TRI->regsOverlap(A, B);
-        };
-        auto RegUsedBeforeDef = [&](Register Reg) {
-          for (auto ScanI = AfterAdd; ScanI != MBB.end(); ++ScanI) {
-            bool HasDef = false;
-            for (const MachineOperand &MO : ScanI->operands()) {
-              if (!MO.isReg() || !RegOverlaps(MO.getReg(), Reg))
-                continue;
-              if (MO.isUse() && !MO.isUndef())
-                return true;
-              if (MO.isDef())
-                HasDef = true;
-            }
-            if (HasDef)
-              return false;
-          }
-          return false;
-        };
-        auto MatchScaledIndex = [&]() {
-          if (MovI == MBB.begin())
-            return false;
+        if (MovI != MBB.begin()) {
+          DeadScaledIndexProducer Producer;
           auto ShiftI = MovI;
           --ShiftI;
-          MachineInstr &ShiftMI = *ShiftI;
-          if (ShiftMI.getOpcode() != (Is64 ? BPF::SLL_ri : BPF::SLL_ri_32))
-            return false;
-          if (!RegOverlaps(ShiftMI.getOperand(0).getReg(), Index) ||
-              !RegOverlaps(ShiftMI.getOperand(1).getReg(), Index))
-            return false;
-          int64_t Shift = ShiftMI.getOperand(2).getImm();
-          if (Shift < 1 || Shift > 3)
-            return false;
-          if (ShiftI == MBB.begin())
-            return false;
-          auto IndexMovI = ShiftI;
-          --IndexMovI;
-          MachineInstr &IndexMov = *IndexMovI;
-          if (IndexMov.getOpcode() != (Is64 ? BPF::MOV_rr : BPF::MOV_rr_32))
-            return false;
-          if (!RegOverlaps(IndexMov.getOperand(0).getReg(), Index))
-            return false;
-          if (LiveOut.contains(Index))
-            return false;
-          if (RegUsedBeforeDef(Index))
-            return false;
-          RawIndex = IndexMov.getOperand(1).getReg();
-          Scale = static_cast<unsigned>(Shift);
-          IndexMovMI = &IndexMov;
-          IndexShiftMI = &ShiftMI;
-          return true;
-        };
-        (void)MatchScaledIndex();
+          if (ShiftI != MBB.begin()) {
+            auto IndexMovI = ShiftI;
+            --IndexMovI;
+            if (matchDeadScaledIndexProducer(TRI, *IndexMovI, *ShiftI, Is64,
+                                             LiveOut, Producer) &&
+                regsOverlap(TRI, Producer.Index, Index) &&
+                !regUsedBeforeDef(TRI, MBB, AfterAdd, Producer.Index)) {
+              RawIndex = Producer.RawIndex;
+              Scale = Producer.Scale;
+              IndexMovMI = Producer.Mov;
+              IndexShiftMI = Producer.Shift;
+            }
+          }
+        }
 
         auto NextI = AfterAdd;
         while (NextI != MBB.end() && NextI->isDebugInstr())
@@ -568,36 +580,22 @@ bool BPFMIPreEmitPeephole::foldScaledIndexMemPseudos() {
            Opcode == BPF::BPF_KINSN_X86_MOVL ||
            Opcode == BPF::BPF_KINSN_X86_MOVQ;
   };
-  auto RegOverlaps = [&](Register A, Register B) {
-    return A && B && TRI->regsOverlap(A, B);
-  };
-
   for (MachineBasicBlock &MBB : *MF) {
     LivePhysRegs LiveOut(*TRI);
     LiveOut.addLiveOuts(MBB);
 
     for (auto I = MBB.begin(); I != MBB.end();) {
-      MachineInstr &MovMI = *I++;
-      unsigned MovOpc = MovMI.getOpcode();
+      auto MovI = I++;
+      unsigned MovOpc = MovI->getOpcode();
       if (MovOpc != BPF::MOV_rr && MovOpc != BPF::MOV_rr_32)
         continue;
       if (I == MBB.end())
         break;
 
-      MachineInstr &ShiftMI = *I;
       bool Is64 = MovOpc == BPF::MOV_rr;
-      if (ShiftMI.getOpcode() != (Is64 ? BPF::SLL_ri : BPF::SLL_ri_32))
-        continue;
-
-      Register Index = MovMI.getOperand(0).getReg();
-      if (LiveOut.contains(Index))
-        continue;
-
-      if (!RegOverlaps(ShiftMI.getOperand(0).getReg(), Index) ||
-          !RegOverlaps(ShiftMI.getOperand(1).getReg(), Index))
-        continue;
-      int64_t Shift = ShiftMI.getOperand(2).getImm();
-      if (Shift < 1 || Shift > 3)
+      DeadScaledIndexProducer Producer;
+      if (!matchDeadScaledIndexProducer(TRI, *MovI, *I, Is64, LiveOut,
+                                        Producer))
         continue;
 
       SmallVector<MachineInstr *, 8> Users;
@@ -607,39 +605,31 @@ bool BPFMIPreEmitPeephole::foldScaledIndexMemPseudos() {
         if (UseMI.isDebugInstr())
           continue;
 
-        bool UsesIndex = false;
-        bool DefsIndex = false;
-        for (const MachineOperand &MO : UseMI.operands()) {
-          if (!MO.isReg() || !RegOverlaps(MO.getReg(), Index))
-            continue;
-          UsesIndex |= MO.isUse() && !MO.isUndef();
-          DefsIndex |= MO.isDef();
-        }
-        if (UsesIndex) {
+        if (UseMI.readsRegister(Producer.Index, TRI)) {
           if (!IsSibMemPseudo(UseMI.getOpcode()) ||
-              !RegOverlaps(UseMI.getOperand(2).getReg(), Index) ||
+              !regsOverlap(TRI, UseMI.getOperand(2).getReg(),
+                           Producer.Index) ||
               UseMI.getOperand(3).getImm() != 0 ||
-              RegOverlaps(UseMI.getOperand(0).getReg(),
-                          MovMI.getOperand(1).getReg())) {
+              regsOverlap(TRI, UseMI.getOperand(0).getReg(),
+                          Producer.RawIndex)) {
             CanFold = false;
             break;
           }
           Users.push_back(&UseMI);
         }
-        if (DefsIndex)
+        if (UseMI.modifiesRegister(Producer.Index, TRI))
           break;
       }
       if (!CanFold || Users.empty())
         continue;
 
-      Register RawIndex = MovMI.getOperand(1).getReg();
       for (MachineInstr *UseMI : Users) {
-        UseMI->getOperand(2).setReg(RawIndex);
-        UseMI->getOperand(3).setImm(Shift);
+        UseMI->getOperand(2).setReg(Producer.RawIndex);
+        UseMI->getOperand(3).setImm(Producer.Scale);
       }
       auto Resume = std::next(I);
-      ShiftMI.eraseFromParent();
-      MovMI.eraseFromParent();
+      Producer.Shift->eraseFromParent();
+      Producer.Mov->eraseFromParent();
       I = Resume;
       Changed = true;
     }

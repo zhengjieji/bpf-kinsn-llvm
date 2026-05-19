@@ -922,11 +922,13 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
       : Pseudo<(outs GPR:$dst), (ins GPR:$src),
                "# BPF_KINSN_X86_BLSRQ $dst, $src", []>;
   def BPF_KINSN_X86_LEAQ
-      : Pseudo<(outs GPR:$dst), (ins GPR:$base, GPR:$index),
-               "# BPF_KINSN_X86_LEAQ $dst, $base, $index", []>;
+      : Pseudo<(outs GPR:$dst),
+               (ins GPR:$base, GPR:$index, i32imm:$scale, i64imm:$disp),
+               "# BPF_KINSN_X86_LEAQ $dst, $base, $index, $scale, $disp", []>;
   def BPF_KINSN_X86_LEAL
-      : Pseudo<(outs GPR32:$dst), (ins GPR32:$base, GPR32:$index),
-               "# BPF_KINSN_X86_LEAL $dst, $base, $index", []>;
+      : Pseudo<(outs GPR32:$dst),
+               (ins GPR32:$base, GPR32:$index, i32imm:$scale, i32imm:$disp),
+               "# BPF_KINSN_X86_LEAL $dst, $base, $index, $scale, $disp", []>;
   def BPF_KINSN_X86_LEAQI
       : Pseudo<(outs GPR:$dst), (ins GPR:$base, i64imm:$disp),
                "# BPF_KINSN_X86_LEAQI $dst, $base, $disp", []>;
