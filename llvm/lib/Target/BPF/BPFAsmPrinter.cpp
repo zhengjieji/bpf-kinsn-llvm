@@ -194,6 +194,38 @@ uint64_t packX86LeaImmPayload(Register Dst, Register Base, int64_t Disp) {
          (static_cast<uint64_t>(static_cast<uint32_t>(Disp)) << 20);
 }
 
+uint64_t packARM64RevPayload(Register Dst, Register Src) {
+  if (Dst != Src)
+    report_fatal_error("bpf_arm64_rev requires tied dst/src registers");
+
+  unsigned DstNo = getBPFRegNo(Dst);
+  if (DstNo >= 10)
+    report_fatal_error("bpf_arm64_rev cannot write r10");
+
+  return packU4(DstNo, 0);
+}
+
+uint64_t packARM64ExtrPayload(Register Dst, Register Src, Register Tmp,
+                              uint64_t Shift, unsigned Width) {
+  unsigned DstNo = getBPFRegNo(Dst);
+  unsigned SrcNo = getBPFRegNo(Src);
+  unsigned TmpNo = getBPFRegNo(Tmp);
+
+  if (Width != 32 && Width != 64)
+    report_fatal_error("bpf_arm64_extr width must be 32 or 64");
+  if (Shift >= Width)
+    report_fatal_error("bpf_arm64_extr shift out of range");
+  if (DstNo >= 10)
+    report_fatal_error("bpf_arm64_extr cannot write r10");
+  if (TmpNo >= 10)
+    report_fatal_error("bpf_arm64_extr tmp cannot be r10");
+  if (TmpNo == DstNo || TmpNo == SrcNo)
+    report_fatal_error("bpf_arm64_extr tmp must differ from dst/src");
+
+  return packU4(DstNo, 0) | packU4(SrcNo, 4) | packU8(Shift, 8) |
+         packU4(TmpNo, 16);
+}
+
 void splitKinsnPayload(uint64_t Payload, unsigned &Dst, unsigned &Off,
                        unsigned &Imm) {
   Dst = Payload & 0xf;
@@ -360,6 +392,50 @@ static unsigned kinsnScratchMaskForMI(const MachineInstr &MI) {
   }
 }
 
+static bool isX86KinsnPseudo(unsigned Opcode) {
+  switch (Opcode) {
+  case BPF::BPF_KINSN_X86_ROLQ:
+  case BPF::BPF_KINSN_X86_ROLW:
+  case BPF::BPF_KINSN_X86_RORXL:
+  case BPF::BPF_KINSN_X86_BSWAPQ:
+  case BPF::BPF_KINSN_X86_BSWAPL:
+  case BPF::BPF_KINSN_X86_POPCNTQ:
+  case BPF::BPF_KINSN_X86_MOVBE16:
+  case BPF::BPF_KINSN_X86_MOVBE32:
+  case BPF::BPF_KINSN_X86_MOVBE64:
+  case BPF::BPF_KINSN_X86_MOVZBL_MEM:
+  case BPF::BPF_KINSN_X86_MOVZWL_MEM:
+  case BPF::BPF_KINSN_X86_MOVL_MEM:
+  case BPF::BPF_KINSN_X86_MOVQ_MEM:
+  case BPF::BPF_KINSN_X86_MOVZBL:
+  case BPF::BPF_KINSN_X86_MOVZWL:
+  case BPF::BPF_KINSN_X86_MOVL:
+  case BPF::BPF_KINSN_X86_MOVQ:
+  case BPF::BPF_KINSN_X86_BEXTRQ:
+  case BPF::BPF_KINSN_X86_BLSIQ:
+  case BPF::BPF_KINSN_X86_BLSRQ:
+  case BPF::BPF_KINSN_X86_LEAQ:
+  case BPF::BPF_KINSN_X86_LEAL:
+  case BPF::BPF_KINSN_X86_LEAQI:
+  case BPF::BPF_KINSN_X86_LEALI:
+  case BPF::BPF_KINSN_X86_CMPL:
+  case BPF::BPF_KINSN_X86_CMPQ:
+  case BPF::BPF_KINSN_X86_SHLDL:
+  case BPF::BPF_KINSN_X86_SHLDQ:
+  case BPF::BPF_KINSN_X86_SHRDL:
+  case BPF::BPF_KINSN_X86_SHRDQ:
+  case BPF::BPF_KINSN_X86_CMOVEL:
+  case BPF::BPF_KINSN_X86_CMOVEQ:
+  case BPF::BPF_KINSN_X86_CMOVNEL:
+  case BPF::BPF_KINSN_X86_CMOVNEQ:
+  case BPF::BPF_KINSN_X86_CMOVBL:
+  case BPF::BPF_KINSN_X86_CMOVBQ:
+    return true;
+  default:
+    return false;
+  }
+}
+
 } // namespace
 
 unsigned BPFAsmPrinter::functionKinsnScratchMask() const {
@@ -490,6 +566,9 @@ void BPFAsmPrinter::emitKinsnPair(uint64_t Payload, StringRef Callee) {
 }
 
 bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
+  if (isBPFKinsnTargetARM64() && isX86KinsnPseudo(MI->getOpcode()))
+    report_fatal_error("x86 kinsn pseudo reached ARM64 kinsn target");
+
   switch (MI->getOpcode()) {
   case BPF::BPF_KINSN_X86_ROLQ:
     emitKinsnPair(packX86RotateImmPayload(MI->getOperand(0).getReg(),
@@ -685,8 +764,35 @@ bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
                                      MI->getOperand(2).getReg()),
                   "bpf_x86_cmovbq");
     return true;
+  case BPF::BPF_KINSN_ARM64_REV16_W:
+    emitKinsnPair(packARM64RevPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg()),
+                  "bpf_arm64_rev16_w");
+    return true;
+  case BPF::BPF_KINSN_ARM64_REV_W:
+    emitKinsnPair(packARM64RevPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg()),
+                  "bpf_arm64_rev_w");
+    return true;
+  case BPF::BPF_KINSN_ARM64_REV_X:
+    emitKinsnPair(packARM64RevPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg()),
+                  "bpf_arm64_rev_x");
+    return true;
+  case BPF::BPF_KINSN_ARM64_EXTR_W:
+    emitKinsnPair(packARM64ExtrPayload(MI->getOperand(0).getReg(),
+                                       MI->getOperand(2).getReg(),
+                                       MI->getOperand(1).getReg(),
+                                       MI->getOperand(3).getImm(), 32),
+                  "bpf_arm64_extr_w");
+    return true;
   case BPF::BPF_KINSN_ARM64_EXTR_X:
-    llvm_unreachable("arm64 kinsn pseudo reached BPF x86 asm printer");
+    emitKinsnPair(packARM64ExtrPayload(MI->getOperand(0).getReg(),
+                                       MI->getOperand(2).getReg(),
+                                       MI->getOperand(1).getReg(),
+                                       MI->getOperand(3).getImm(), 64),
+                  "bpf_arm64_extr_x");
+    return true;
   default:
     return false;
   }

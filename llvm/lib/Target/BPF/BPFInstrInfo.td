@@ -977,9 +977,26 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
         : Pseudo<(outs GPR:$dst), (ins GPR:$old, GPR:$src),
                  "# BPF_KINSN_X86_CMOVBQ $dst, $old, $src", []>;
   }
-  def BPF_KINSN_ARM64_EXTR_X
-      : Pseudo<(outs GPR:$dst), (ins GPR:$lo, GPR:$hi, i32imm:$lsb),
-               "# BPF_KINSN_ARM64_EXTR_X $dst, $lo, $hi, $lsb", []>;
+  let Constraints = "$dst = $src" in {
+    def BPF_KINSN_ARM64_REV16_W
+        : Pseudo<(outs GPR:$dst), (ins GPR:$src),
+                 "# BPF_KINSN_ARM64_REV16_W $dst, $src", []>;
+    def BPF_KINSN_ARM64_REV_W
+        : Pseudo<(outs GPR:$dst), (ins GPR:$src),
+                 "# BPF_KINSN_ARM64_REV_W $dst, $src", []>;
+    def BPF_KINSN_ARM64_REV_X
+        : Pseudo<(outs GPR:$dst), (ins GPR:$src),
+                 "# BPF_KINSN_ARM64_REV_X $dst, $src", []>;
+  }
+  let Constraints = "@earlyclobber $tmp" in {
+    def BPF_KINSN_ARM64_EXTR_W
+        : Pseudo<(outs GPR32:$dst, GPR32:$tmp),
+                 (ins GPR32:$src, i32imm:$shift),
+                 "# BPF_KINSN_ARM64_EXTR_W $dst, $src, $tmp, $shift", []>;
+    def BPF_KINSN_ARM64_EXTR_X
+        : Pseudo<(outs GPR:$dst, GPR:$tmp), (ins GPR:$src, i32imm:$shift),
+                 "# BPF_KINSN_ARM64_EXTR_X $dst, $src, $tmp, $shift", []>;
+  }
 }
 
 class NOP_I<string OpcodeStr>
