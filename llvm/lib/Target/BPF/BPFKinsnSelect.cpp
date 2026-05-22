@@ -168,20 +168,30 @@ namespace {
 
 struct UnaryPattern {
   unsigned Opcode;
-  unsigned PseudoOpcode;
+  unsigned X86PseudoOpcode;
+  unsigned ARM64PseudoOpcode;
 };
 
 constexpr UnaryPattern UnaryPatterns[] = {
-    {BPF::BSWAP16, BPF::BPF_KINSN_X86_ROLW},
-    {BPF::BE16, BPF::BPF_KINSN_X86_ROLW},
-    {BPF::LE16, BPF::BPF_KINSN_X86_ROLW},
-    {BPF::BSWAP32, BPF::BPF_KINSN_X86_BSWAPL},
-    {BPF::BE32, BPF::BPF_KINSN_X86_BSWAPL},
-    {BPF::LE32, BPF::BPF_KINSN_X86_BSWAPL},
-    {BPF::BSWAP64, BPF::BPF_KINSN_X86_BSWAPQ},
-    {BPF::BE64, BPF::BPF_KINSN_X86_BSWAPQ},
-    {BPF::LE64, BPF::BPF_KINSN_X86_BSWAPQ},
+    {BPF::BSWAP16, BPF::BPF_KINSN_X86_ROLW, BPF::BPF_KINSN_ARM64_REV16_W},
+    {BPF::BE16, BPF::BPF_KINSN_X86_ROLW, BPF::BPF_KINSN_ARM64_REV16_W},
+    {BPF::LE16, BPF::BPF_KINSN_X86_ROLW, BPF::BPF_KINSN_ARM64_REV16_W},
+    {BPF::BSWAP32, BPF::BPF_KINSN_X86_BSWAPL, BPF::BPF_KINSN_ARM64_REV_W},
+    {BPF::BE32, BPF::BPF_KINSN_X86_BSWAPL, BPF::BPF_KINSN_ARM64_REV_W},
+    {BPF::LE32, BPF::BPF_KINSN_X86_BSWAPL, BPF::BPF_KINSN_ARM64_REV_W},
+    {BPF::BSWAP64, BPF::BPF_KINSN_X86_BSWAPQ, BPF::BPF_KINSN_ARM64_REV_X},
+    {BPF::BE64, BPF::BPF_KINSN_X86_BSWAPQ, BPF::BPF_KINSN_ARM64_REV_X},
+    {BPF::LE64, BPF::BPF_KINSN_X86_BSWAPQ, BPF::BPF_KINSN_ARM64_REV_X},
 };
+
+static unsigned getUnaryPseudoOpcode(const UnaryPattern &Pattern) {
+  return isBPFKinsnTargetARM64() ? Pattern.ARM64PseudoOpcode
+                                 : Pattern.X86PseudoOpcode;
+}
+
+static bool isBPFReg10(Register Reg) {
+  return Reg == BPF::R10 || Reg == BPF::W10;
+}
 
 struct MovbePattern {
   unsigned SwapOpcode;
@@ -203,14 +213,21 @@ struct RotatePattern {
   unsigned LeftShiftOpcode;
   unsigned RightShiftOpcode;
   unsigned Width;
-  unsigned PseudoOpcode;
+  unsigned X86PseudoOpcode;
+  unsigned ARM64PseudoOpcode;
 };
 
 constexpr RotatePattern RotatePatterns[] = {
-    {BPF::OR_rr, BPF::SLL_ri, BPF::SRL_ri, 64, BPF::BPF_KINSN_X86_ROLQ},
+    {BPF::OR_rr, BPF::SLL_ri, BPF::SRL_ri, 64, BPF::BPF_KINSN_X86_ROLQ,
+     BPF::BPF_KINSN_ARM64_EXTR_X},
     {BPF::OR_rr_32, BPF::SLL_ri_32, BPF::SRL_ri_32, 32,
-     BPF::BPF_KINSN_X86_RORXL},
+     BPF::BPF_KINSN_X86_RORXL, BPF::BPF_KINSN_ARM64_EXTR_W},
 };
+
+static unsigned getRotatePseudoOpcode(const RotatePattern &Pattern) {
+  return isBPFKinsnTargetARM64() ? Pattern.ARM64PseudoOpcode
+                                 : Pattern.X86PseudoOpcode;
+}
 
 struct ShdPattern {
   unsigned OrOpcode;
@@ -271,6 +288,7 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override {
     if (!EnableBPFKinsnSelect || skipFunction(MF.getFunction()))
       return false;
+    parseBPFKinsnPolicyModes();
 
     TII = MF.getSubtarget<BPFSubtarget>().getInstrInfo();
     MRI = &MF.getRegInfo();
@@ -354,6 +372,16 @@ private:
 
   void collectCandidates(MachineInstr &MI, SmallVectorImpl<Candidate> &Out,
                          bool LocalSubprog) {
+    if (isBPFKinsnTargetARM64()) {
+      if (!LocalSubprog) {
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Unary))
+          collectUnary(MI, Out);
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Rotate))
+          collectRotate(MI, Out);
+      }
+      return;
+    }
+
     // Kinsn proof sequences may consume verifier stack. In bpf2bpf callees that
     // stack is combined with the caller, so keep local-subprog rewrites off
     // until the module proof stack contract is tightened.
@@ -387,11 +415,16 @@ private:
       if (MI.getOpcode() != Pattern.Opcode)
         continue;
 
+      Register Dst = MI.getOperand(0).getReg();
+      Register Src = MI.getOperand(1).getReg();
+      if (isBPFKinsnTargetARM64() && isBPFReg10(Dst))
+        continue;
+
       int Score =
           score(blockWeight(*MI.getParent()) - 2, BPFKinsnPolicyKind::Unary);
       Out.push_back(
-          {Candidate::Unary, &MI, nullptr, nullptr, nullptr, Pattern.PseudoOpcode,
-           MI.getOperand(1).getReg(), Register(), 0, 0, Score});
+          {Candidate::Unary, &MI, nullptr, nullptr, nullptr,
+           getUnaryPseudoOpcode(Pattern), Src, Register(), 0, 0, Score});
       return;
     }
   }
@@ -883,7 +916,8 @@ private:
 
       int Score = blockWeight(*MI.getParent()) * 3 - 1;
       Out.push_back({Candidate::Rotate, &MI, LeftShiftMI, RightShiftMI, nullptr,
-                     Pattern.PseudoOpcode, Src, Register(), 0, Shift, Score});
+                     getRotatePseudoOpcode(Pattern), Src, Register(), 0, Shift,
+                     Score});
       return;
     }
   }
@@ -1042,6 +1076,27 @@ private:
       if (C.Left)
         C.Left->eraseFromParent();
       ++NumBextrSelected;
+      return true;
+    }
+
+    if (C.K == Candidate::Rotate && isBPFKinsnTargetARM64()) {
+      const TargetRegisterClass *RC =
+          C.PseudoOpcode == BPF::BPF_KINSN_ARM64_EXTR_W
+              ? &BPF::GPR32RegClass
+              : &BPF::GPRRegClass;
+      Register Tmp = MRI->createVirtualRegister(RC);
+      MachineInstrBuilder Builder =
+          BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode));
+      Builder.addReg(C.Root->getOperand(0).getReg(), RegState::Define)
+          .addReg(Tmp, RegState::Define | RegState::EarlyClobber)
+          .addReg(C.Src)
+          .addImm(C.Shift);
+      C.Root->eraseFromParent();
+      if (C.Left)
+        C.Left->eraseFromParent();
+      if (C.Right)
+        C.Right->eraseFromParent();
+      ++NumRotateSelected;
       return true;
     }
 
