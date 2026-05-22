@@ -389,10 +389,10 @@ public:
 
     bool Changed;
     Changed = eliminateRedundantMov();
-    if (EnableBPFKinsnSelect &&
+    if (EnableBPFKinsnSelect && isBPFKinsnTargetX86() &&
         isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::PreEmitLea))
       Changed = selectKinsnLeaPairs() || Changed;
-    if (EnableBPFKinsnSelect &&
+    if (EnableBPFKinsnSelect && isBPFKinsnTargetX86() &&
         isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::ScaledIndexMem))
       Changed = foldScaledIndexMemPseudos() || Changed;
     if (SupportGotol)

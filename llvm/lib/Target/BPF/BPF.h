@@ -60,6 +60,14 @@ enum class BPFKinsnPolicyMode : unsigned {
   Force,
 };
 
+enum class BPFKinsnTargetKind : unsigned {
+  X86,
+  ARM64,
+};
+
+BPFKinsnTargetKind getBPFKinsnTargetKind();
+bool isBPFKinsnTargetX86();
+bool isBPFKinsnTargetARM64();
 BPFKinsnPolicyMode getBPFKinsnPolicyMode(BPFKinsnPolicyKind Kind);
 bool isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind Kind);
 bool isBPFKinsnPolicyForced(BPFKinsnPolicyKind Kind);

@@ -41,6 +41,13 @@ using namespace llvm;
 cl::opt<bool>
     EnableBPFKinsnSelect("bpf-enable-kinsn-select", cl::Hidden, cl::init(false),
                          cl::desc("Enable BPF kinsn MachineInstr selection"));
+static cl::opt<BPFKinsnTargetKind> BPFKinsnTarget(
+    "bpf-kinsn-target", cl::Hidden, cl::init(BPFKinsnTargetKind::X86),
+    cl::desc("Select the native kinsn target"),
+    cl::values(clEnumValN(BPFKinsnTargetKind::X86, "x86",
+                          "Select x86 bpf_x86_* kfunc pseudos"),
+               clEnumValN(BPFKinsnTargetKind::ARM64, "arm64",
+                          "Select ARM64 bpf_arm64_* kfunc pseudos")));
 static cl::list<std::string> BPFKinsnModeSpecs(
     "bpf-kinsn-mode", cl::Hidden, cl::CommaSeparated,
     cl::desc("Set kinsn selector policy as family=disable|cost|force; "
@@ -55,6 +62,16 @@ static constexpr unsigned NumBPFKinsnPolicyKinds =
 static std::array<BPFKinsnPolicyMode, NumBPFKinsnPolicyKinds>
     BPFKinsnPolicyModes;
 static bool BPFKinsnPolicyParsed = false;
+
+BPFKinsnTargetKind llvm::getBPFKinsnTargetKind() { return BPFKinsnTarget; }
+
+bool llvm::isBPFKinsnTargetX86() {
+  return getBPFKinsnTargetKind() == BPFKinsnTargetKind::X86;
+}
+
+bool llvm::isBPFKinsnTargetARM64() {
+  return getBPFKinsnTargetKind() == BPFKinsnTargetKind::ARM64;
+}
 
 static BPFKinsnPolicyKind parseBPFKinsnPolicyKind(StringRef Name) {
   if (Name == "unary")
