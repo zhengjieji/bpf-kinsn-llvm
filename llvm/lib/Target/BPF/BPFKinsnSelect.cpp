@@ -376,6 +376,8 @@ private:
       if (!LocalSubprog) {
         if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Unary))
           collectUnary(MI, Out);
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Bextr))
+          collectBextr(MI, Out);
         if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Rotate))
           collectRotate(MI, Out);
       }
@@ -792,6 +794,39 @@ private:
       return;
 
     Register ShiftReg = MI.getOperand(1).getReg();
+    if (isBPFKinsnTargetARM64()) {
+      if (Len > 32)
+        return;
+
+      Register Src = ShiftReg;
+      MachineInstr *ShiftMI = nullptr;
+      unsigned Start = 0;
+      if (ShiftReg.isVirtual()) {
+        MachineInstr *DefMI = MRI->getVRegDef(ShiftReg);
+        if (DefMI && DefMI->getOpcode() == BPF::SRL_ri &&
+            DefMI->getParent() == MI.getParent() &&
+            MRI->hasOneNonDBGUse(ShiftReg)) {
+          int64_t StartImm = DefMI->getOperand(2).getImm();
+          if (StartImm < 0)
+            return;
+          Start = static_cast<unsigned>(StartImm);
+          Src = DefMI->getOperand(1).getReg();
+          ShiftMI = DefMI;
+        }
+      }
+
+      if (Start >= 64 || Start + Len > 64)
+        return;
+      if (isBPFReg10(MI.getOperand(0).getReg()))
+        return;
+
+      int Score = score(-1, BPFKinsnPolicyKind::Bextr);
+      Out.push_back({Candidate::Bextr, &MI, ShiftMI, nullptr, nullptr,
+                     BPF::BPF_KINSN_ARM64_UBFM_X, Src, Register(),
+                     static_cast<int64_t>(Len), Start, Score});
+      return;
+    }
+
     if (!ShiftReg.isVirtual() || !MRI->hasOneNonDBGUse(ShiftReg))
       return;
 
@@ -1064,6 +1099,19 @@ private:
     }
 
     if (C.K == Candidate::Bextr) {
+      if (isBPFKinsnTargetARM64()) {
+        BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
+                C.Root->getOperand(0).getReg())
+            .addReg(C.Src)
+            .addImm(C.Shift)
+            .addImm(C.Offset);
+        C.Root->eraseFromParent();
+        if (C.Left)
+          C.Left->eraseFromParent();
+        ++NumBextrSelected;
+        return true;
+      }
+
       Register Control = MRI->createVirtualRegister(&BPF::GPRRegClass);
       BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(BPF::MOV_ri),
               Control)

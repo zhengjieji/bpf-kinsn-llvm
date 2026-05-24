@@ -226,6 +226,24 @@ uint64_t packARM64ExtrPayload(Register Dst, Register Src, Register Tmp,
          packU4(TmpNo, 16);
 }
 
+uint64_t packARM64UbfmPayload(Register Dst, Register Src, uint64_t Start,
+                              uint64_t BitLen) {
+  if (Dst != Src)
+    report_fatal_error("bpf_arm64_ubfm requires tied dst/src registers");
+
+  unsigned DstNo = getBPFRegNo(Dst);
+  if (DstNo >= 10)
+    report_fatal_error("bpf_arm64_ubfm cannot write r10");
+  if (Start >= 64)
+    report_fatal_error("bpf_arm64_ubfm start out of range");
+  if (BitLen == 0 || BitLen > 32)
+    report_fatal_error("bpf_arm64_ubfm bit length out of range");
+  if (Start + BitLen > 64)
+    report_fatal_error("bpf_arm64_ubfm extract range out of bounds");
+
+  return packU4(DstNo, 0) | packU8(Start, 8) | packU8(BitLen, 16);
+}
+
 void splitKinsnPayload(uint64_t Payload, unsigned &Dst, unsigned &Off,
                        unsigned &Imm) {
   Dst = Payload & 0xf;
@@ -792,6 +810,13 @@ bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
                                        MI->getOperand(1).getReg(),
                                        MI->getOperand(3).getImm(), 64),
                   "bpf_arm64_extr_x");
+    return true;
+  case BPF::BPF_KINSN_ARM64_UBFM_X:
+    emitKinsnPair(packARM64UbfmPayload(MI->getOperand(0).getReg(),
+                                       MI->getOperand(1).getReg(),
+                                       MI->getOperand(2).getImm(),
+                                       MI->getOperand(3).getImm()),
+                  "bpf_arm64_ubfm_x");
     return true;
   default:
     return false;

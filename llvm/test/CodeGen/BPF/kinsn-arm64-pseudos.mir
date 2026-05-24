@@ -10,6 +10,8 @@
 # CHECK-NEXT: kinsn_call bpf_arm64_extr_x
 # CHECK-NEXT: kinsn_sidecar 7, 32857, 0
 # CHECK-NEXT: kinsn_call bpf_arm64_extr_w
+# CHECK-NEXT: kinsn_sidecar 9, 20576, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_ubfm_x
 
 --- |
   target triple = "bpfel"
@@ -27,13 +29,14 @@ alignment:       8
 tracksRegLiveness: true
 body:             |
   bb.0.entry:
-    liveins: $r1, $r2, $r3, $r5, $w9
+    liveins: $r1, $r2, $r3, $r5, $w9, $r9
 
     $r1 = BPF_KINSN_ARM64_REV16_W $r1
     $r2 = BPF_KINSN_ARM64_REV_W $r2
     $r3 = BPF_KINSN_ARM64_REV_X $r3
     $r4, $r6 = BPF_KINSN_ARM64_EXTR_X $r5, 13
     $w7, $w8 = BPF_KINSN_ARM64_EXTR_W $w9, 5
+    $r9 = BPF_KINSN_ARM64_UBFM_X $r9, 6, 5
     $r0 = COPY $r1
     RET implicit $r0
 ...
