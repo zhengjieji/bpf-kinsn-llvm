@@ -1,4 +1,4 @@
-# RUN: llc -mtriple=bpfel -mcpu=v4 -x mir %s -o - | FileCheck %s
+# RUN: llc -mtriple=bpfel -mcpu=v4 -bpf-kinsn-target=arm64 -x mir %s -o - | FileCheck %s
 
 # CHECK: kinsn_sidecar 1, 0, 0
 # CHECK-NEXT: kinsn_call bpf_arm64_rev16_w

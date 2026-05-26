@@ -244,6 +244,33 @@ uint64_t packARM64UbfmPayload(Register Dst, Register Src, uint64_t Start,
   return packU4(DstNo, 0) | packU8(Start, 8) | packU8(BitLen, 16);
 }
 
+static bool arm64ScaledUOffOk(int64_t Offset, unsigned Shift) {
+  return Offset >= 0 && Offset <= (0xfffLL << Shift) &&
+         !(Offset & ((1LL << Shift) - 1));
+}
+
+static bool arm64UnscaledSOffOk(int64_t Offset) {
+  return Offset >= -256 && Offset <= 255;
+}
+
+uint64_t packARM64LdrPayload(Register Dst, Register Base, int64_t Offset,
+                             unsigned Shift) {
+  unsigned DstNo = getBPFRegNo(Dst);
+  unsigned BaseNo = getBPFRegNo(Base);
+
+  if (!isInt<16>(Offset))
+    report_fatal_error("bpf_arm64_ldr offset exceeds s16 payload");
+  if (DstNo >= 10)
+    report_fatal_error("bpf_arm64_ldr cannot write r10");
+  if (BaseNo > 10)
+    report_fatal_error("bpf_arm64_ldr base register out of range");
+  if (!arm64ScaledUOffOk(Offset, Shift) && !arm64UnscaledSOffOk(Offset))
+    report_fatal_error("bpf_arm64_ldr offset cannot be encoded by arm64");
+
+  return packU4(DstNo, 0) | packU4(BaseNo, 4) |
+         (static_cast<uint64_t>(static_cast<uint16_t>(Offset)) << 8);
+}
+
 void splitKinsnPayload(uint64_t Payload, unsigned &Dst, unsigned &Off,
                        unsigned &Imm) {
   Dst = Payload & 0xf;
@@ -454,6 +481,23 @@ static bool isX86KinsnPseudo(unsigned Opcode) {
   }
 }
 
+static bool isARM64KinsnPseudo(unsigned Opcode) {
+  switch (Opcode) {
+  case BPF::BPF_KINSN_ARM64_REV16_W:
+  case BPF::BPF_KINSN_ARM64_REV_W:
+  case BPF::BPF_KINSN_ARM64_REV_X:
+  case BPF::BPF_KINSN_ARM64_EXTR_W:
+  case BPF::BPF_KINSN_ARM64_EXTR_X:
+  case BPF::BPF_KINSN_ARM64_UBFM_X:
+  case BPF::BPF_KINSN_ARM64_LDRH:
+  case BPF::BPF_KINSN_ARM64_LDR_W:
+  case BPF::BPF_KINSN_ARM64_LDR_X:
+    return true;
+  default:
+    return false;
+  }
+}
+
 } // namespace
 
 unsigned BPFAsmPrinter::functionKinsnScratchMask() const {
@@ -586,6 +630,8 @@ void BPFAsmPrinter::emitKinsnPair(uint64_t Payload, StringRef Callee) {
 bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
   if (isBPFKinsnTargetARM64() && isX86KinsnPseudo(MI->getOpcode()))
     report_fatal_error("x86 kinsn pseudo reached ARM64 kinsn target");
+  if (isBPFKinsnTargetX86() && isARM64KinsnPseudo(MI->getOpcode()))
+    report_fatal_error("ARM64 kinsn pseudo reached x86 kinsn target");
 
   switch (MI->getOpcode()) {
   case BPF::BPF_KINSN_X86_ROLQ:
@@ -817,6 +863,24 @@ bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
                                        MI->getOperand(2).getImm(),
                                        MI->getOperand(3).getImm()),
                   "bpf_arm64_ubfm_x");
+    return true;
+  case BPF::BPF_KINSN_ARM64_LDRH:
+    emitKinsnPair(packARM64LdrPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg(),
+                                      MI->getOperand(2).getImm(), 1),
+                  "bpf_arm64_ldrh");
+    return true;
+  case BPF::BPF_KINSN_ARM64_LDR_W:
+    emitKinsnPair(packARM64LdrPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg(),
+                                      MI->getOperand(2).getImm(), 2),
+                  "bpf_arm64_ldr_w");
+    return true;
+  case BPF::BPF_KINSN_ARM64_LDR_X:
+    emitKinsnPair(packARM64LdrPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg(),
+                                      MI->getOperand(2).getImm(), 3),
+                  "bpf_arm64_ldr_x");
     return true;
   default:
     return false;

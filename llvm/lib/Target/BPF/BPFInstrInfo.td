@@ -992,6 +992,15 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
                  (ins GPR:$src, i32imm:$start, i32imm:$bit_len),
                  "# BPF_KINSN_ARM64_UBFM_X $dst, $src, $start, $bit_len", []>;
   }
+  def BPF_KINSN_ARM64_LDRH
+      : Pseudo<(outs GPR32:$dst), (ins GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_LDRH $dst, $base, $off", []>;
+  def BPF_KINSN_ARM64_LDR_W
+      : Pseudo<(outs GPR32:$dst), (ins GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_LDR_W $dst, $base, $off", []>;
+  def BPF_KINSN_ARM64_LDR_X
+      : Pseudo<(outs GPR:$dst), (ins GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_LDR_X $dst, $base, $off", []>;
   let Constraints = "@earlyclobber $tmp" in {
     def BPF_KINSN_ARM64_EXTR_W
         : Pseudo<(outs GPR32:$dst, GPR32:$tmp),

@@ -374,6 +374,8 @@ private:
                          bool LocalSubprog) {
     if (isBPFKinsnTargetARM64()) {
       if (!LocalSubprog) {
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::WideLoad))
+          collectWideLoadLE(MI, Out, false);
         if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Unary))
           collectUnary(MI, Out);
         if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Bextr))
@@ -612,13 +614,23 @@ private:
       if (!matchWideLoadTree(MI, TreeRoot, Width, false, Base, Offset, Erase))
         continue;
 
-      unsigned LoadOpcode =
-          VerifierNative ? (Width == 8 ? BPF::LDD
-                            : Width == 4 ? BPF::LDW
-                                         : BPF::LDH)
-                         : (Width == 8 ? BPF::BPF_KINSN_X86_MOVQ_MEM
-                            : Width == 4 ? BPF::BPF_KINSN_X86_MOVL_MEM
-                                         : BPF::BPF_KINSN_X86_MOVZWL_MEM);
+      unsigned LoadOpcode = 0;
+      if (isBPFKinsnTargetARM64()) {
+        unsigned Shift = Log2_32(Width);
+        if (!arm64MemOffsetOk(Offset, Shift))
+          continue;
+        LoadOpcode = Width == 8 ? BPF::BPF_KINSN_ARM64_LDR_X
+                   : Width == 4 ? BPF::BPF_KINSN_ARM64_LDR_W
+                                : BPF::BPF_KINSN_ARM64_LDRH;
+      } else {
+        LoadOpcode =
+            VerifierNative ? (Width == 8 ? BPF::LDD
+                              : Width == 4 ? BPF::LDW
+                                           : BPF::LDH)
+                           : (Width == 8 ? BPF::BPF_KINSN_X86_MOVQ_MEM
+                              : Width == 4 ? BPF::BPF_KINSN_X86_MOVL_MEM
+                                           : BPF::BPF_KINSN_X86_MOVZWL_MEM);
+      }
       int Score = blockWeight(*MI.getParent()) * static_cast<int>(Width + 2) - 1;
       Candidate C{Candidate::WideLoadLE, &MI, nullptr, nullptr, nullptr,
                   LoadOpcode, Register(), Base, Offset, Width, Score};
@@ -718,6 +730,26 @@ private:
            Opcode == BPF::BPF_KINSN_X86_MOVZWL_MEM ||
            Opcode == BPF::BPF_KINSN_X86_MOVL_MEM ||
            Opcode == BPF::BPF_KINSN_X86_MOVQ_MEM;
+  }
+
+  static bool isARM64LdrPseudo(unsigned Opcode) {
+    return Opcode == BPF::BPF_KINSN_ARM64_LDRH ||
+           Opcode == BPF::BPF_KINSN_ARM64_LDR_W ||
+           Opcode == BPF::BPF_KINSN_ARM64_LDR_X;
+  }
+
+  static bool arm64ScaledUOffOk(int64_t Offset, unsigned Shift) {
+    return Offset >= 0 && Offset <= (0xfffLL << Shift) &&
+           !(Offset & ((1LL << Shift) - 1));
+  }
+
+  static bool arm64UnscaledSOffOk(int64_t Offset) {
+    return Offset >= -256 && Offset <= 255;
+  }
+
+  static bool arm64MemOffsetOk(int64_t Offset, unsigned Shift) {
+    return isInt<16>(Offset) &&
+           (arm64ScaledUOffOk(Offset, Shift) || arm64UnscaledSOffOk(Offset));
   }
 
   void collectIndexedLoad(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
@@ -1062,7 +1094,9 @@ private:
 
     if (C.K == Candidate::WideLoadLE) {
       if (C.PseudoOpcode == BPF::LDD || C.PseudoOpcode == BPF::LDW ||
-          C.PseudoOpcode == BPF::LDH || isDirectMovLoadPseudo(C.PseudoOpcode)) {
+          C.PseudoOpcode == BPF::LDH ||
+          isDirectMovLoadPseudo(C.PseudoOpcode) ||
+          isARM64LdrPseudo(C.PseudoOpcode)) {
         BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
                 C.Root->getOperand(0).getReg())
             .addReg(C.Base)
