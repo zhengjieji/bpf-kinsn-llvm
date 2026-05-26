@@ -271,6 +271,29 @@ uint64_t packARM64LdrPayload(Register Dst, Register Base, int64_t Offset,
          (static_cast<uint64_t>(static_cast<uint16_t>(Offset)) << 8);
 }
 
+uint64_t packARM64TstPayload(Register Reg) {
+  unsigned RegNo = getBPFRegNo(Reg);
+  if (RegNo >= 10)
+    report_fatal_error("bpf_arm64_tst cannot use r10");
+  return packU4(RegNo, 0);
+}
+
+uint64_t packARM64CselPayload(Register Dst, Register True, Register False,
+                              Register Cond) {
+  unsigned DstNo = getBPFRegNo(Dst);
+  unsigned TrueNo = getBPFRegNo(True);
+  unsigned FalseNo = getBPFRegNo(False);
+  unsigned CondNo = getBPFRegNo(Cond);
+
+  if (DstNo >= 10)
+    report_fatal_error("bpf_arm64_csel_ne cannot write r10");
+  if (TrueNo >= 10 || FalseNo >= 10 || CondNo >= 10)
+    report_fatal_error("bpf_arm64_csel_ne cannot use r10");
+
+  return packU4(DstNo, 0) | packU4(TrueNo, 4) | packU4(FalseNo, 8) |
+         packU4(CondNo, 12);
+}
+
 void splitKinsnPayload(uint64_t Payload, unsigned &Dst, unsigned &Off,
                        unsigned &Imm) {
   Dst = Payload & 0xf;
@@ -492,6 +515,7 @@ static bool isARM64KinsnPseudo(unsigned Opcode) {
   case BPF::BPF_KINSN_ARM64_LDRH:
   case BPF::BPF_KINSN_ARM64_LDR_W:
   case BPF::BPF_KINSN_ARM64_LDR_X:
+  case BPF::BPF_KINSN_ARM64_TST_CSEL_NE:
     return true;
   default:
     return false;
@@ -881,6 +905,15 @@ bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
                                       MI->getOperand(1).getReg(),
                                       MI->getOperand(2).getImm(), 3),
                   "bpf_arm64_ldr_x");
+    return true;
+  case BPF::BPF_KINSN_ARM64_TST_CSEL_NE:
+    emitKinsnPair(packARM64TstPayload(MI->getOperand(1).getReg()),
+                  "bpf_arm64_tst");
+    emitKinsnPair(packARM64CselPayload(MI->getOperand(0).getReg(),
+                                       MI->getOperand(2).getReg(),
+                                       MI->getOperand(3).getReg(),
+                                       MI->getOperand(1).getReg()),
+                  "bpf_arm64_csel_ne");
     return true;
   default:
     return false;

@@ -1156,6 +1156,24 @@ BPFTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
     }
   }
 
+  if (EnableBPFKinsnSelect && isBPFKinsnTargetARM64() &&
+      isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Cmov) &&
+      Opc == BPF::Select_Ri) {
+    int CC = MI.getOperand(3).getImm();
+    int64_t RHS = MI.getOperand(2).getImm();
+    if (RHS == 0 && (CC == ISD::SETNE || CC == ISD::SETEQ)) {
+      Register TrueVal = MI.getOperand(CC == ISD::SETNE ? 4 : 5).getReg();
+      Register FalseVal = MI.getOperand(CC == ISD::SETNE ? 5 : 4).getReg();
+      BuildMI(*BB, MI, DL, TII.get(BPF::BPF_KINSN_ARM64_TST_CSEL_NE),
+              MI.getOperand(0).getReg())
+          .addReg(MI.getOperand(1).getReg())
+          .addReg(TrueVal)
+          .addReg(FalseVal);
+      MI.eraseFromParent();
+      return BB;
+    }
+  }
+
   // To "insert" a SELECT instruction, we actually have to insert the diamond
   // control-flow pattern.  The incoming instruction knows the destination vreg
   // to set, the condition code register to branch on, the true/false values to
