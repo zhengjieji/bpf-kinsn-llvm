@@ -48,6 +48,7 @@ enum class BPFKinsnPolicyKind : unsigned {
   Rotate,
   Shd,
   Cmov,
+  Ccmp,
   Popcnt,
   PreEmitLea,
   ScaledIndexMem,

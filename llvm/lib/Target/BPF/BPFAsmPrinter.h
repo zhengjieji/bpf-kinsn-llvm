@@ -47,6 +47,7 @@ private:
   unsigned functionKinsnScratchMask() const;
   void emitScratchInit(unsigned Mask);
   void emitKinsnPair(uint64_t Payload, StringRef Callee);
+  void emitARM64CcmpCset(const MachineInstr *MI, unsigned Count, bool Width32);
   bool emitKinsnPseudo(const MachineInstr *MI);
 };
 

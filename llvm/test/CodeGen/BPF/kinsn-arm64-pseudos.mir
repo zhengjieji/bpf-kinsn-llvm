@@ -16,6 +16,30 @@
 # CHECK-NEXT: kinsn_call bpf_arm64_tst
 # CHECK-NEXT: kinsn_sidecar 1, 595, 0
 # CHECK-NEXT: kinsn_call bpf_arm64_csel_ne
+# CHECK-NEXT: kinsn_sidecar 1, 0, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_cmp_x
+# CHECK-NEXT: kinsn_sidecar 2, 0, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_ccmp_x
+# CHECK-NEXT: kinsn_sidecar 4, 528, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_cset_x_cond
+# CHECK-NEXT: kinsn_sidecar 1, 0, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_cmp_x
+# CHECK-NEXT: kinsn_sidecar 2, 1, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_ccmp_x
+# CHECK-NEXT: kinsn_sidecar 3, 1, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_ccmp_x
+# CHECK-NEXT: kinsn_sidecar 5, 12821, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_cset_x_cond
+# CHECK-NEXT: kinsn_sidecar 1, 0, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_cmp_x
+# CHECK-NEXT: kinsn_sidecar 2, 0, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_ccmp_x
+# CHECK-NEXT: kinsn_sidecar 3, 0, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_ccmp_x
+# CHECK-NEXT: kinsn_sidecar 7, 0, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_ccmp_x
+# CHECK-NEXT: kinsn_sidecar 6, 12818, 7
+# CHECK-NEXT: kinsn_call bpf_arm64_cset_x_cond
 
 --- |
   target triple = "bpfel"
@@ -33,7 +57,7 @@ alignment:       8
 tracksRegLiveness: true
 body:             |
   bb.0.entry:
-    liveins: $r1, $r2, $r3, $r5, $w9, $r9
+    liveins: $r1, $r2, $r3, $r5, $r7, $w9, $r9
 
     $r1 = BPF_KINSN_ARM64_REV16_W $r1
     $r2 = BPF_KINSN_ARM64_REV_W $r2
@@ -42,6 +66,9 @@ body:             |
     $w7, $w8 = BPF_KINSN_ARM64_EXTR_W $w9, 5
     $r9 = BPF_KINSN_ARM64_UBFM_X $r9, 6, 5
     $r1 = BPF_KINSN_ARM64_TST_CSEL_NE $r2, $r3, $r5
+    $r4 = BPF_KINSN_ARM64_CCMP_CSET_X2 0, $r1, $r2
+    $r5 = BPF_KINSN_ARM64_CCMP_CSET_X3 1, $r1, $r2, $r3
+    $r6 = BPF_KINSN_ARM64_CCMP_CSET_X4 0, $r1, $r2, $r3, $r7
     $r0 = COPY $r1
     RET implicit $r0
 ...

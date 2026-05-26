@@ -18,6 +18,8 @@
 #include "BTFDebug.h"
 #include "MCTargetDesc/BPFInstPrinter.h"
 #include "TargetInfo/BPFTargetInfo.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
@@ -49,6 +51,8 @@ namespace {
 constexpr uint64_t X86FormRR = 1;
 constexpr uint64_t X86FormImm = 2;
 constexpr uint64_t X86FormMem = 4;
+constexpr uint64_t ARM64CcmpModeFailEq = 0;
+constexpr uint64_t ARM64CcmpModeFailNe = 1;
 
 unsigned getBPFRegNo(Register Reg) {
   switch (Reg) {
@@ -294,6 +298,50 @@ uint64_t packARM64CselPayload(Register Dst, Register True, Register False,
          packU4(CondNo, 12);
 }
 
+static void checkARM64CcmpMode(uint64_t Mode) {
+  if (Mode != ARM64CcmpModeFailEq && Mode != ARM64CcmpModeFailNe)
+    report_fatal_error("bpf_arm64_ccmp mode must be 0 or 1");
+}
+
+uint64_t packARM64CmpPayload(Register Reg) {
+  unsigned RegNo = getBPFRegNo(Reg);
+  if (RegNo >= 10)
+    report_fatal_error("bpf_arm64_cmp_x cannot use r10 in LLVM-selected form");
+
+  return packU4(RegNo, 0);
+}
+
+uint64_t packARM64CcmpPayload(Register Reg, uint64_t Mode) {
+  unsigned RegNo = getBPFRegNo(Reg);
+  checkARM64CcmpMode(Mode);
+  if (RegNo >= 10)
+    report_fatal_error("bpf_arm64_ccmp_x cannot use r10 in LLVM-selected form");
+
+  return packU4(RegNo, 0) | packU4(Mode, 4);
+}
+
+uint64_t packARM64CsetPayload(Register Dst, ArrayRef<Register> Terms,
+                              uint64_t Mode, bool Width32) {
+  unsigned DstNo = getBPFRegNo(Dst);
+  checkARM64CcmpMode(Mode);
+  if (DstNo >= 10)
+    report_fatal_error("bpf_arm64_cset_x_cond cannot write r10");
+  if (Terms.size() < 2 || Terms.size() > 4)
+    report_fatal_error("bpf_arm64_cset_x_cond requires 2..4 terms");
+
+  uint64_t Payload = packU4(DstNo, 0) | ((Terms.size() - 2) << 4) |
+                     (Mode << 6) | (static_cast<uint64_t>(Width32) << 7);
+  for (unsigned I = 0; I < Terms.size(); ++I) {
+    unsigned RegNo = getBPFRegNo(Terms[I]);
+    if (RegNo >= 10)
+      report_fatal_error("bpf_arm64_cset_x_cond cannot use r10 in LLVM-selected form");
+    if (RegNo == DstNo)
+      report_fatal_error("bpf_arm64_cset_x_cond dst must differ from inputs");
+    Payload |= packU4(RegNo, 8 + 4 * I);
+  }
+  return Payload;
+}
+
 void splitKinsnPayload(uint64_t Payload, unsigned &Dst, unsigned &Off,
                        unsigned &Imm) {
   Dst = Payload & 0xf;
@@ -516,6 +564,12 @@ static bool isARM64KinsnPseudo(unsigned Opcode) {
   case BPF::BPF_KINSN_ARM64_LDR_W:
   case BPF::BPF_KINSN_ARM64_LDR_X:
   case BPF::BPF_KINSN_ARM64_TST_CSEL_NE:
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_X2:
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_X3:
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_X4:
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_W2:
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_W3:
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_W4:
     return true;
   default:
     return false;
@@ -649,6 +703,23 @@ void BPFAsmPrinter::emitKinsnPair(uint64_t Payload, StringRef Callee) {
   Call.addOperand(
       MCOperand::createExpr(MCSymbolRefExpr::create(Sym, OutContext)));
   EmitToStreamer(*OutStreamer, Call);
+}
+
+void BPFAsmPrinter::emitARM64CcmpCset(const MachineInstr *MI, unsigned Count,
+                                      bool Width32) {
+  uint64_t Mode = MI->getOperand(1).getImm();
+  SmallVector<Register, 4> Terms;
+  for (unsigned I = 0; I < Count; ++I)
+    Terms.push_back(MI->getOperand(2 + I).getReg());
+
+  emitKinsnPair(packARM64CmpPayload(Terms[0]),
+                Width32 ? "bpf_arm64_cmp_w" : "bpf_arm64_cmp_x");
+  for (unsigned I = 1; I < Count; ++I)
+    emitKinsnPair(packARM64CcmpPayload(Terms[I], Mode),
+                  Width32 ? "bpf_arm64_ccmp_w" : "bpf_arm64_ccmp_x");
+  emitKinsnPair(
+      packARM64CsetPayload(MI->getOperand(0).getReg(), Terms, Mode, Width32),
+      "bpf_arm64_cset_x_cond");
 }
 
 bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
@@ -914,6 +985,24 @@ bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
                                        MI->getOperand(3).getReg(),
                                        MI->getOperand(1).getReg()),
                   "bpf_arm64_csel_ne");
+    return true;
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_X2:
+    emitARM64CcmpCset(MI, 2, false);
+    return true;
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_X3:
+    emitARM64CcmpCset(MI, 3, false);
+    return true;
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_X4:
+    emitARM64CcmpCset(MI, 4, false);
+    return true;
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_W2:
+    emitARM64CcmpCset(MI, 2, true);
+    return true;
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_W3:
+    emitARM64CcmpCset(MI, 3, true);
+    return true;
+  case BPF::BPF_KINSN_ARM64_CCMP_CSET_W4:
+    emitARM64CcmpCset(MI, 4, true);
     return true;
   default:
     return false;

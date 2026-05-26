@@ -1006,6 +1006,40 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
                (ins GPR:$cond, GPR:$truev, GPR:$falsev),
                "# BPF_KINSN_ARM64_TST_CSEL_NE $dst, $cond, $truev, $falsev",
                []>;
+  let Constraints = "@earlyclobber $dst" in {
+    def BPF_KINSN_ARM64_CCMP_CSET_X2
+        : Pseudo<(outs GPR:$dst),
+                 (ins i32imm:$mode, GPR:$term0, GPR:$term1),
+                 "# BPF_KINSN_ARM64_CCMP_CSET_X2 $dst, $mode, $term0, $term1",
+                 []>;
+    def BPF_KINSN_ARM64_CCMP_CSET_X3
+        : Pseudo<(outs GPR:$dst),
+                 (ins i32imm:$mode, GPR:$term0, GPR:$term1, GPR:$term2),
+                 "# BPF_KINSN_ARM64_CCMP_CSET_X3 $dst, $mode, $term0, $term1, $term2",
+                 []>;
+    def BPF_KINSN_ARM64_CCMP_CSET_X4
+        : Pseudo<(outs GPR:$dst),
+                 (ins i32imm:$mode, GPR:$term0, GPR:$term1, GPR:$term2,
+                      GPR:$term3),
+                 "# BPF_KINSN_ARM64_CCMP_CSET_X4 $dst, $mode, $term0, $term1, $term2, $term3",
+                 []>;
+    def BPF_KINSN_ARM64_CCMP_CSET_W2
+        : Pseudo<(outs GPR32:$dst),
+                 (ins i32imm:$mode, GPR32:$term0, GPR32:$term1),
+                 "# BPF_KINSN_ARM64_CCMP_CSET_W2 $dst, $mode, $term0, $term1",
+                 []>;
+    def BPF_KINSN_ARM64_CCMP_CSET_W3
+        : Pseudo<(outs GPR32:$dst),
+                 (ins i32imm:$mode, GPR32:$term0, GPR32:$term1, GPR32:$term2),
+                 "# BPF_KINSN_ARM64_CCMP_CSET_W3 $dst, $mode, $term0, $term1, $term2",
+                 []>;
+    def BPF_KINSN_ARM64_CCMP_CSET_W4
+        : Pseudo<(outs GPR32:$dst),
+                 (ins i32imm:$mode, GPR32:$term0, GPR32:$term1, GPR32:$term2,
+                      GPR32:$term3),
+                 "# BPF_KINSN_ARM64_CCMP_CSET_W4 $dst, $mode, $term0, $term1, $term2, $term3",
+                 []>;
+  }
   let Constraints = "@earlyclobber $tmp" in {
     def BPF_KINSN_ARM64_EXTR_W
         : Pseudo<(outs GPR32:$dst, GPR32:$tmp),

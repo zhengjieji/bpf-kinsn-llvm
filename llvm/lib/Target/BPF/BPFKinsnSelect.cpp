@@ -94,6 +94,8 @@ static BPFKinsnPolicyKind parseBPFKinsnPolicyKind(StringRef Name) {
     return BPFKinsnPolicyKind::Shd;
   if (Name == "cmov")
     return BPFKinsnPolicyKind::Cmov;
+  if (Name == "ccmp")
+    return BPFKinsnPolicyKind::Ccmp;
   if (Name == "popcnt")
     return BPFKinsnPolicyKind::Popcnt;
   if (Name == "preemit-lea")
@@ -161,6 +163,7 @@ STATISTIC(NumRotateSelected, "Number of rotate kinsn pseudos selected");
 STATISTIC(NumShdSelected, "Number of SHLD/SHRD kinsn pseudos selected");
 STATISTIC(NumWideLoadSelected,
           "Number of little-endian byte-ladder loads packed");
+STATISTIC(NumCcmpSelected, "Number of boolean AND chains selected as CCMP/CSET");
 STATISTIC(NumCandidatesSkipped,
           "Number of non-profitable or overlapping kinsn candidates skipped");
 
@@ -256,7 +259,8 @@ struct Candidate {
     Bextr,
     Bmi1,
     Rotate,
-    Shd
+    Shd,
+    CcmpBoolAnd
   } K;
   MachineInstr *Root;
   MachineInstr *Left = nullptr;
@@ -269,6 +273,7 @@ struct Candidate {
   unsigned Shift = 0;
   int Score;
   SmallVector<MachineInstr *, 8> Erase;
+  SmallVector<Register, 4> Terms;
 };
 
 class BPFKinsnSelect final : public MachineFunctionPass {
@@ -382,6 +387,8 @@ private:
           collectBextr(MI, Out);
         if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Rotate))
           collectRotate(MI, Out);
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Ccmp))
+          collectCcmpBoolAnd(MI, Out);
       }
       return;
     }
@@ -1043,6 +1050,91 @@ private:
     }
   }
 
+  bool isBool01Reg(Register Reg, DenseSet<Register> &Visiting) const {
+    if (!Reg.isVirtual())
+      return false;
+
+    MachineInstr *Def = MRI->getVRegDef(Reg);
+    if (!Def)
+      return false;
+
+    if (Def->getOpcode() == BPF::MOV_ri_32)
+      return Def->getOperand(1).isImm() &&
+             (Def->getOperand(1).getImm() == 0 ||
+              Def->getOperand(1).getImm() == 1);
+
+    if (!Def->isPHI())
+      return false;
+
+    if (!Visiting.insert(Reg).second)
+      return false;
+
+    for (unsigned I = 1, E = Def->getNumOperands(); I < E; I += 2) {
+      if (!Def->getOperand(I).isReg() ||
+          !isBool01Reg(Def->getOperand(I).getReg(), Visiting)) {
+        Visiting.erase(Reg);
+        return false;
+      }
+    }
+    Visiting.erase(Reg);
+    return true;
+  }
+
+  bool isBool01Reg(Register Reg) const {
+    DenseSet<Register> Visiting;
+    return isBool01Reg(Reg, Visiting);
+  }
+
+  bool collectCcmpBoolAndLeaves(Register Reg, SmallVectorImpl<Register> &Terms,
+                                SmallVectorImpl<MachineInstr *> &Erase) const {
+    if (Terms.size() > 4 || !Reg.isVirtual())
+      return false;
+
+    MachineInstr *Def = MRI->getVRegDef(Reg);
+    if (!Def)
+      return false;
+
+    if (Def->getOpcode() == BPF::AND_rr_32 && MRI->hasOneNonDBGUse(Reg)) {
+      addUniqueErase(Def, Erase);
+      return collectCcmpBoolAndLeaves(Def->getOperand(1).getReg(), Terms,
+                                      Erase) &&
+             collectCcmpBoolAndLeaves(Def->getOperand(2).getReg(), Terms,
+                                      Erase);
+    }
+
+    if (!isBool01Reg(Reg))
+      return false;
+
+    Terms.push_back(Reg);
+    return Terms.size() <= 4;
+  }
+
+  void collectCcmpBoolAnd(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    if (MI.getOpcode() != BPF::AND_rr_32)
+      return;
+
+    SmallVector<Register, 4> Terms;
+    SmallVector<MachineInstr *, 8> Erase;
+    if (!collectCcmpBoolAndLeaves(MI.getOperand(1).getReg(), Terms, Erase) ||
+        !collectCcmpBoolAndLeaves(MI.getOperand(2).getReg(), Terms, Erase))
+      return;
+    if (Terms.size() < 2 || Terms.size() > 4)
+      return;
+
+    unsigned PseudoOpcode =
+        Terms.size() == 2 ? BPF::BPF_KINSN_ARM64_CCMP_CSET_W2
+        : Terms.size() == 3 ? BPF::BPF_KINSN_ARM64_CCMP_CSET_W3
+                            : BPF::BPF_KINSN_ARM64_CCMP_CSET_W4;
+    int Score = isBPFKinsnPolicyForced(BPFKinsnPolicyKind::Ccmp)
+                    ? static_cast<int>(Terms.size())
+                    : -1;
+    Candidate C{Candidate::CcmpBoolAnd, &MI, nullptr, nullptr, nullptr,
+                PseudoOpcode, Register(), Register(), 0, 0, Score};
+    C.Erase = std::move(Erase);
+    C.Terms = std::move(Terms);
+    Out.push_back(std::move(C));
+  }
+
   static bool overlaps(const Candidate &C, const DenseSet<MachineInstr *> &Used) {
     if (Used.contains(C.Root) || (C.Left && Used.contains(C.Left)) ||
         (C.Right && Used.contains(C.Right)) ||
@@ -1179,6 +1271,20 @@ private:
       if (C.Right)
         C.Right->eraseFromParent();
       ++NumRotateSelected;
+      return true;
+    }
+
+    if (C.K == Candidate::CcmpBoolAnd) {
+      MachineInstrBuilder Builder =
+          BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
+                  C.Root->getOperand(0).getReg());
+      Builder.addImm(0);
+      for (Register Term : C.Terms)
+        Builder.addReg(Term);
+      C.Root->eraseFromParent();
+      for (MachineInstr *MI : C.Erase)
+        MI->eraseFromParent();
+      ++NumCcmpSelected;
       return true;
     }
 
