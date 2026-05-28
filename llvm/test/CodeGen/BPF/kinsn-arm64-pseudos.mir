@@ -12,6 +12,26 @@
 # CHECK-NEXT: kinsn_call bpf_arm64_extr_w
 # CHECK-NEXT: kinsn_sidecar 9, 20576, 0
 # CHECK-NEXT: kinsn_call bpf_arm64_ubfm_x
+# CHECK-NEXT: kinsn_sidecar 1, 4258, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_stp_x
+# CHECK-NEXT: kinsn_sidecar 1, 4258, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_ldp_x
+# CHECK-NEXT: kinsn_sidecar 1, 82, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_ldrb
+# CHECK-NEXT: kinsn_sidecar 1, 1313, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_strb
+# CHECK-NEXT: kinsn_sidecar 1, 1575, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_strh
+# CHECK-NEXT: kinsn_sidecar 1, 2087, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_str_w
+# CHECK-NEXT: kinsn_sidecar 1, 4257, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_str_x
+# CHECK-NEXT: kinsn_sidecar 2, 82, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_strb
+# CHECK-NEXT: kinsn_sidecar 3, 4, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_mov_x
+# CHECK-NEXT: kinsn_sidecar 2, 0, 0
+# CHECK-NEXT: kinsn_call bpf_arm64_prfm_pldl1keep
 # CHECK-NEXT: kinsn_sidecar 2, 0, 0
 # CHECK-NEXT: kinsn_call bpf_arm64_tst
 # CHECK-NEXT: kinsn_sidecar 1, 595, 0
@@ -65,6 +85,16 @@ body:             |
     $r4, $r6 = BPF_KINSN_ARM64_EXTR_X $r5, 13
     $w7, $w8 = BPF_KINSN_ARM64_EXTR_W $w9, 5
     $r9 = BPF_KINSN_ARM64_UBFM_X $r9, 6, 5
+    BPF_KINSN_ARM64_STP_X $r1, $r2, $r10, 16
+    $r1, $r2 = BPF_KINSN_ARM64_LDP_X $r10, 16
+    $w1 = BPF_KINSN_ARM64_LDRB $r2, 5
+    BPF_KINSN_ARM64_STRB $w1, $r2, 5
+    BPF_KINSN_ARM64_STRH $w7, $r2, 6
+    BPF_KINSN_ARM64_STR_W $w7, $r2, 8
+    BPF_KINSN_ARM64_STR_X $r1, $r10, 16
+    BPF_KINSN_ARM64_STRB_ZERO $r2, 5
+    $r3 = BPF_KINSN_ARM64_MOV_X $r4
+    BPF_KINSN_ARM64_PRFM_PLDL1KEEP $r2
     $r1 = BPF_KINSN_ARM64_TST_CSEL_NE $r2, $r3, $r5
     $r4 = BPF_KINSN_ARM64_CCMP_CSET_X2 0, $r1, $r2
     $r5 = BPF_KINSN_ARM64_CCMP_CSET_X3 1, $r1, $r2, $r3

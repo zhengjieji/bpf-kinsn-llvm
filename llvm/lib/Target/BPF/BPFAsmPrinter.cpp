@@ -275,6 +275,105 @@ uint64_t packARM64LdrPayload(Register Dst, Register Base, int64_t Offset,
          (static_cast<uint64_t>(static_cast<uint16_t>(Offset)) << 8);
 }
 
+uint64_t packARM64StrPayload(Register Src, Register Base, int64_t Offset,
+                             unsigned Shift) {
+  constexpr uint64_t ARM64StrFormReg = 1;
+  unsigned SrcNo = getBPFRegNo(Src);
+  unsigned BaseNo = getBPFRegNo(Base);
+
+  if (!isInt<16>(Offset))
+    report_fatal_error("bpf_arm64_str offset exceeds s16 payload");
+  if (SrcNo >= 10)
+    report_fatal_error("bpf_arm64_str cannot use r10 as source");
+  if (BaseNo > 10)
+    report_fatal_error("bpf_arm64_str base register out of range");
+  if (!arm64ScaledUOffOk(Offset, Shift) && !arm64UnscaledSOffOk(Offset))
+    report_fatal_error("bpf_arm64_str offset cannot be encoded by arm64");
+
+  return ARM64StrFormReg | packU4(SrcNo, 4) | packU4(BaseNo, 8) |
+         (static_cast<uint64_t>(static_cast<uint16_t>(Offset)) << 12);
+}
+
+uint64_t packARM64StrbZeroPayload(Register Base, int64_t Offset) {
+  constexpr uint64_t ARM64StrFormZero = 2;
+  unsigned BaseNo = getBPFRegNo(Base);
+
+  if (!isInt<16>(Offset))
+    report_fatal_error("bpf_arm64_strb zero offset exceeds s16 payload");
+  if (BaseNo > 10)
+    report_fatal_error("bpf_arm64_strb zero base register out of range");
+  if (!arm64ScaledUOffOk(Offset, 0) && !arm64UnscaledSOffOk(Offset))
+    report_fatal_error("bpf_arm64_strb zero offset cannot be encoded by arm64");
+
+  return ARM64StrFormZero | packU4(BaseNo, 4) |
+         (static_cast<uint64_t>(static_cast<uint16_t>(Offset)) << 8);
+}
+
+uint64_t packARM64MovPayload(Register Dst, Register Src) {
+  unsigned DstNo = getBPFRegNo(Dst);
+  unsigned SrcNo = getBPFRegNo(Src);
+
+  if (DstNo >= 10)
+    report_fatal_error("bpf_arm64_mov_x cannot write r10");
+  if (SrcNo > 10)
+    report_fatal_error("bpf_arm64_mov_x source register out of range");
+
+  return packU4(DstNo, 0) | packU4(SrcNo, 4);
+}
+
+uint64_t packARM64PrfmPayload(Register Ptr) {
+  unsigned PtrNo = getBPFRegNo(Ptr);
+  if (PtrNo > 10)
+    report_fatal_error("bpf_arm64_prfm_pldl1keep pointer register out of range");
+  return packU4(PtrNo, 0);
+}
+
+static bool arm64PairSOffOk(int64_t Offset) {
+  return Offset >= -512 && Offset <= 504 && Offset % 8 == 0;
+}
+
+uint64_t packARM64StpPayload(Register SrcLo, Register SrcHi, Register Base,
+                             int64_t Offset) {
+  unsigned SrcLoNo = getBPFRegNo(SrcLo);
+  unsigned SrcHiNo = getBPFRegNo(SrcHi);
+  unsigned BaseNo = getBPFRegNo(Base);
+
+  if (!isInt<16>(Offset))
+    report_fatal_error("bpf_arm64_stp_x offset exceeds s16 payload");
+  if (!arm64PairSOffOk(Offset))
+    report_fatal_error("bpf_arm64_stp_x offset cannot be encoded by arm64");
+  if (SrcLoNo >= 10 || SrcHiNo >= 10)
+    report_fatal_error("bpf_arm64_stp_x cannot use r10 as a source");
+  if (BaseNo != 10)
+    report_fatal_error("bpf_arm64_stp_x LLVM-selected form requires r10 base");
+
+  return packU4(SrcLoNo, 0) | packU4(SrcHiNo, 4) | packU4(BaseNo, 8) |
+         (static_cast<uint64_t>(static_cast<uint16_t>(Offset)) << 12);
+}
+
+uint64_t packARM64LdpPayload(Register DstLo, Register DstHi, Register Base,
+                             int64_t Offset) {
+  unsigned DstLoNo = getBPFRegNo(DstLo);
+  unsigned DstHiNo = getBPFRegNo(DstHi);
+  unsigned BaseNo = getBPFRegNo(Base);
+
+  if (!isInt<16>(Offset))
+    report_fatal_error("bpf_arm64_ldp_x offset exceeds s16 payload");
+  if (!arm64PairSOffOk(Offset))
+    report_fatal_error("bpf_arm64_ldp_x offset cannot be encoded by arm64");
+  if (DstLoNo == DstHiNo)
+    report_fatal_error("bpf_arm64_ldp_x destinations must differ");
+  if (DstLoNo >= 10 || DstHiNo >= 10)
+    report_fatal_error("bpf_arm64_ldp_x cannot write r10");
+  if (BaseNo != 10)
+    report_fatal_error("bpf_arm64_ldp_x LLVM-selected form requires r10 base");
+  if (BaseNo == DstLoNo || BaseNo == DstHiNo)
+    report_fatal_error("bpf_arm64_ldp_x base cannot be a destination");
+
+  return packU4(DstLoNo, 0) | packU4(DstHiNo, 4) | packU4(BaseNo, 8) |
+         (static_cast<uint64_t>(static_cast<uint16_t>(Offset)) << 12);
+}
+
 uint64_t packARM64TstPayload(Register Reg) {
   unsigned RegNo = getBPFRegNo(Reg);
   if (RegNo >= 10)
@@ -560,9 +659,19 @@ static bool isARM64KinsnPseudo(unsigned Opcode) {
   case BPF::BPF_KINSN_ARM64_EXTR_W:
   case BPF::BPF_KINSN_ARM64_EXTR_X:
   case BPF::BPF_KINSN_ARM64_UBFM_X:
+  case BPF::BPF_KINSN_ARM64_LDRB:
   case BPF::BPF_KINSN_ARM64_LDRH:
   case BPF::BPF_KINSN_ARM64_LDR_W:
   case BPF::BPF_KINSN_ARM64_LDR_X:
+  case BPF::BPF_KINSN_ARM64_STP_X:
+  case BPF::BPF_KINSN_ARM64_LDP_X:
+  case BPF::BPF_KINSN_ARM64_STRB:
+  case BPF::BPF_KINSN_ARM64_STRH:
+  case BPF::BPF_KINSN_ARM64_STR_W:
+  case BPF::BPF_KINSN_ARM64_STR_X:
+  case BPF::BPF_KINSN_ARM64_STRB_ZERO:
+  case BPF::BPF_KINSN_ARM64_MOV_X:
+  case BPF::BPF_KINSN_ARM64_PRFM_PLDL1KEEP:
   case BPF::BPF_KINSN_ARM64_TST_CSEL_NE:
   case BPF::BPF_KINSN_ARM64_CCMP_CSET_X2:
   case BPF::BPF_KINSN_ARM64_CCMP_CSET_X3:
@@ -959,6 +1068,12 @@ bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
                                        MI->getOperand(3).getImm()),
                   "bpf_arm64_ubfm_x");
     return true;
+  case BPF::BPF_KINSN_ARM64_LDRB:
+    emitKinsnPair(packARM64LdrPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg(),
+                                      MI->getOperand(2).getImm(), 0),
+                  "bpf_arm64_ldrb");
+    return true;
   case BPF::BPF_KINSN_ARM64_LDRH:
     emitKinsnPair(packARM64LdrPayload(MI->getOperand(0).getReg(),
                                       MI->getOperand(1).getReg(),
@@ -976,6 +1091,58 @@ bool BPFAsmPrinter::emitKinsnPseudo(const MachineInstr *MI) {
                                       MI->getOperand(1).getReg(),
                                       MI->getOperand(2).getImm(), 3),
                   "bpf_arm64_ldr_x");
+    return true;
+  case BPF::BPF_KINSN_ARM64_STP_X:
+    emitKinsnPair(packARM64StpPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg(),
+                                      MI->getOperand(2).getReg(),
+                                      MI->getOperand(3).getImm()),
+                  "bpf_arm64_stp_x");
+    return true;
+  case BPF::BPF_KINSN_ARM64_LDP_X:
+    emitKinsnPair(packARM64LdpPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg(),
+                                      MI->getOperand(2).getReg(),
+                                      MI->getOperand(3).getImm()),
+                  "bpf_arm64_ldp_x");
+    return true;
+  case BPF::BPF_KINSN_ARM64_STRB:
+    emitKinsnPair(packARM64StrPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg(),
+                                      MI->getOperand(2).getImm(), 0),
+                  "bpf_arm64_strb");
+    return true;
+  case BPF::BPF_KINSN_ARM64_STRH:
+    emitKinsnPair(packARM64StrPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg(),
+                                      MI->getOperand(2).getImm(), 1),
+                  "bpf_arm64_strh");
+    return true;
+  case BPF::BPF_KINSN_ARM64_STR_W:
+    emitKinsnPair(packARM64StrPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg(),
+                                      MI->getOperand(2).getImm(), 2),
+                  "bpf_arm64_str_w");
+    return true;
+  case BPF::BPF_KINSN_ARM64_STR_X:
+    emitKinsnPair(packARM64StrPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg(),
+                                      MI->getOperand(2).getImm(), 3),
+                  "bpf_arm64_str_x");
+    return true;
+  case BPF::BPF_KINSN_ARM64_STRB_ZERO:
+    emitKinsnPair(packARM64StrbZeroPayload(MI->getOperand(0).getReg(),
+                                           MI->getOperand(1).getImm()),
+                  "bpf_arm64_strb");
+    return true;
+  case BPF::BPF_KINSN_ARM64_MOV_X:
+    emitKinsnPair(packARM64MovPayload(MI->getOperand(0).getReg(),
+                                      MI->getOperand(1).getReg()),
+                  "bpf_arm64_mov_x");
+    return true;
+  case BPF::BPF_KINSN_ARM64_PRFM_PLDL1KEEP:
+    emitKinsnPair(packARM64PrfmPayload(MI->getOperand(0).getReg()),
+                  "bpf_arm64_prfm_pldl1keep");
     return true;
   case BPF::BPF_KINSN_ARM64_TST_CSEL_NE:
     emitKinsnPair(packARM64TstPayload(MI->getOperand(1).getReg()),

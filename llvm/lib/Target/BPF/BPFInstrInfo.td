@@ -987,11 +987,14 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
     def BPF_KINSN_ARM64_REV_X
         : Pseudo<(outs GPR:$dst), (ins GPR:$src),
                  "# BPF_KINSN_ARM64_REV_X $dst, $src", []>;
-    def BPF_KINSN_ARM64_UBFM_X
-        : Pseudo<(outs GPR:$dst),
-                 (ins GPR:$src, i32imm:$start, i32imm:$bit_len),
-                 "# BPF_KINSN_ARM64_UBFM_X $dst, $src, $start, $bit_len", []>;
+  def BPF_KINSN_ARM64_UBFM_X
+      : Pseudo<(outs GPR:$dst),
+               (ins GPR:$src, i32imm:$start, i32imm:$bit_len),
+               "# BPF_KINSN_ARM64_UBFM_X $dst, $src, $start, $bit_len", []>;
   }
+  def BPF_KINSN_ARM64_LDRB
+      : Pseudo<(outs GPR32:$dst), (ins GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_LDRB $dst, $base, $off", []>;
   def BPF_KINSN_ARM64_LDRH
       : Pseudo<(outs GPR32:$dst), (ins GPR:$base, i32imm:$off),
                "# BPF_KINSN_ARM64_LDRH $dst, $base, $off", []>;
@@ -1001,6 +1004,33 @@ let hasSideEffects = 1, isCodeGenOnly = 1 in {
   def BPF_KINSN_ARM64_LDR_X
       : Pseudo<(outs GPR:$dst), (ins GPR:$base, i32imm:$off),
                "# BPF_KINSN_ARM64_LDR_X $dst, $base, $off", []>;
+  def BPF_KINSN_ARM64_STP_X
+      : Pseudo<(outs), (ins GPR:$src_lo, GPR:$src_hi, GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_STP_X $src_lo, $src_hi, $base, $off", []>;
+  def BPF_KINSN_ARM64_LDP_X
+      : Pseudo<(outs GPR:$dst_lo, GPR:$dst_hi), (ins GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_LDP_X $dst_lo, $dst_hi, $base, $off", []>;
+  def BPF_KINSN_ARM64_STRB
+      : Pseudo<(outs), (ins GPR32:$src, GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_STRB $src, $base, $off", []>;
+  def BPF_KINSN_ARM64_STRH
+      : Pseudo<(outs), (ins GPR32:$src, GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_STRH $src, $base, $off", []>;
+  def BPF_KINSN_ARM64_STR_W
+      : Pseudo<(outs), (ins GPR32:$src, GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_STR_W $src, $base, $off", []>;
+  def BPF_KINSN_ARM64_STR_X
+      : Pseudo<(outs), (ins GPR:$src, GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_STR_X $src, $base, $off", []>;
+  def BPF_KINSN_ARM64_STRB_ZERO
+      : Pseudo<(outs), (ins GPR:$base, i32imm:$off),
+               "# BPF_KINSN_ARM64_STRB_ZERO $base, $off", []>;
+  def BPF_KINSN_ARM64_MOV_X
+      : Pseudo<(outs GPR:$dst), (ins GPR:$src),
+               "# BPF_KINSN_ARM64_MOV_X $dst, $src", []>;
+  def BPF_KINSN_ARM64_PRFM_PLDL1KEEP
+      : Pseudo<(outs), (ins GPR:$ptr),
+               "# BPF_KINSN_ARM64_PRFM_PLDL1KEEP $ptr", []>;
   def BPF_KINSN_ARM64_TST_CSEL_NE
       : Pseudo<(outs GPR:$dst),
                (ins GPR:$cond, GPR:$truev, GPR:$falsev),

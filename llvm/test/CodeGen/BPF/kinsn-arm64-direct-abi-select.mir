@@ -1,0 +1,190 @@
+# RUN: llc -mtriple=bpfel -mcpu=v4 -run-pass=bpf-kinsn-select \
+# RUN:   -bpf-enable-kinsn-select \
+# RUN:   -bpf-kinsn-target=arm64 \
+# RUN:   -bpf-kinsn-mode=all=disable \
+# RUN:   -bpf-kinsn-mode=direct-load=force -x mir %s -o - | FileCheck %s --check-prefix=LOAD
+# RUN: llc -mtriple=bpfel -mcpu=v4 -run-pass=bpf-kinsn-select \
+# RUN:   -bpf-enable-kinsn-select \
+# RUN:   -bpf-kinsn-target=arm64 \
+# RUN:   -bpf-kinsn-mode=all=disable \
+# RUN:   -bpf-kinsn-mode=direct-store=force -x mir %s -o - | FileCheck %s --check-prefix=STORE
+# RUN: llc -mtriple=bpfel -mcpu=v4 -run-pass=bpf-kinsn-select \
+# RUN:   -bpf-enable-kinsn-select \
+# RUN:   -bpf-kinsn-target=arm64 \
+# RUN:   -bpf-kinsn-mode=all=disable \
+# RUN:   -bpf-kinsn-mode=mov=force -x mir %s -o - | FileCheck %s --check-prefix=MOV
+# RUN: llc -mtriple=bpfel -mcpu=v4 -run-pass=bpf-kinsn-select \
+# RUN:   -bpf-enable-kinsn-select \
+# RUN:   -bpf-kinsn-target=arm64 \
+# RUN:   -bpf-kinsn-mode=all=disable \
+# RUN:   -bpf-kinsn-mode=prefetch=force -x mir %s -o - | FileCheck %s --check-prefix=PREFETCH
+# RUN: llc -mtriple=bpfel -mcpu=v4 -run-pass=bpf-kinsn-select \
+# RUN:   -bpf-enable-kinsn-select \
+# RUN:   -bpf-kinsn-target=arm64 \
+# RUN:   -bpf-kinsn-mode=all=disable -x mir %s -o - | FileCheck %s --check-prefix=DISABLE
+
+# LOAD: name: direct_loads
+# LOAD: $w1 = BPF_KINSN_ARM64_LDRB $r10, -1
+# LOAD: $w2 = BPF_KINSN_ARM64_LDRH $r10, -2
+# LOAD: $w3 = BPF_KINSN_ARM64_LDR_W $r10, -4
+# LOAD: $r4 = BPF_KINSN_ARM64_LDR_X $r10, -8
+# LOAD: name: direct_stack_memory
+# LOAD: $w5 = BPF_KINSN_ARM64_LDRB %stack.0, 0
+# LOAD: $w6 = BPF_KINSN_ARM64_LDRH %stack.0, 2
+# LOAD: $w7 = BPF_KINSN_ARM64_LDR_W %stack.0, 4
+# LOAD: $r8 = BPF_KINSN_ARM64_LDR_X %stack.0, 8
+# LOAD: name: direct_non_stack_memory
+# LOAD: $w9 = LDB32 $r1, 0
+# LOAD: $w2 = LDW32 $r1, 4
+
+# STORE: name: direct_stores
+# STORE: BPF_KINSN_ARM64_STRB $w1, $r10, -1
+# STORE: BPF_KINSN_ARM64_STRH $w2, $r10, -2
+# STORE: BPF_KINSN_ARM64_STR_W $w3, $r10, -4
+# STORE: BPF_KINSN_ARM64_STR_X $r4, $r10, -8
+# STORE: BPF_KINSN_ARM64_STRB_ZERO $r10, -9
+# STORE: name: direct_stack_memory
+# STORE: BPF_KINSN_ARM64_STRB $w1, %stack.0, 0
+# STORE: BPF_KINSN_ARM64_STRH $w2, %stack.0, 2
+# STORE: BPF_KINSN_ARM64_STR_W $w3, %stack.0, 4
+# STORE: BPF_KINSN_ARM64_STR_X $r4, %stack.0, 8
+# STORE: name: direct_non_stack_memory
+# STORE: STB32 $w1, $r1, 0
+# STORE: STW32 $w3, $r1, 4
+
+# MOV: name: mov64
+# MOV: $r1 = BPF_KINSN_ARM64_MOV_X $r2
+
+# PREFETCH: name: prefetch_before_load
+# PREFETCH: BPF_KINSN_ARM64_PRFM_PLDL1KEEP $r10
+# PREFETCH-NEXT: $r1 = LDD $r10, 0
+
+# DISABLE-NOT: BPF_KINSN_ARM64_LDRB
+# DISABLE-NOT: BPF_KINSN_ARM64_STRB
+# DISABLE-NOT: BPF_KINSN_ARM64_MOV_X
+# DISABLE-NOT: BPF_KINSN_ARM64_PRFM_PLDL1KEEP
+
+--- |
+  target triple = "bpfel"
+
+  define dso_local i64 @direct_loads(i64 %x) #0 section "xdp" {
+  entry:
+    ret i64 %x
+  }
+
+  define dso_local i64 @direct_stores(i64 %x) #0 section "xdp" {
+  entry:
+    ret i64 %x
+  }
+
+  define dso_local i64 @direct_stack_memory(i64 %x) #0 section "xdp" {
+  entry:
+    ret i64 %x
+  }
+
+  define dso_local i64 @direct_non_stack_memory(i64 %x) #0 section "xdp" {
+  entry:
+    ret i64 %x
+  }
+
+  define dso_local i64 @mov64(i64 %x) #0 section "xdp" {
+  entry:
+    ret i64 %x
+  }
+
+  define dso_local i64 @prefetch_before_load(i64 %x) #0 section "xdp" {
+  entry:
+    ret i64 %x
+  }
+
+  attributes #0 = { "target-cpu"="v4" }
+...
+---
+name:            direct_loads
+alignment:       8
+tracksRegLiveness: true
+body:             |
+  bb.0.entry:
+    $w1 = LDB32 $r10, -1
+    $w2 = LDH32 $r10, -2
+    $w3 = LDW32 $r10, -4
+    $r4 = LDD $r10, -8
+    $r0 = COPY $r4
+    RET implicit $r0
+...
+---
+name:            direct_stores
+alignment:       8
+tracksRegLiveness: true
+body:             |
+  bb.0.entry:
+    liveins: $w1, $w2, $w3, $r4
+
+    STB32 $w1, $r10, -1
+    STH32 $w2, $r10, -2
+    STW32 $w3, $r10, -4
+    STD $r4, $r10, -8
+    STB_imm 0, $r10, -9
+    $r0 = COPY $r4
+    RET implicit $r0
+...
+---
+name:            direct_stack_memory
+alignment:       8
+tracksRegLiveness: true
+stack:
+  - { id: 0, name: '', type: default, offset: 0, size: 16, alignment: 8,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+body:             |
+  bb.0.entry:
+    liveins: $w1, $w2, $w3, $r4
+
+    STB32 $w1, %stack.0, 0
+    STH32 $w2, %stack.0, 2
+    STW32 $w3, %stack.0, 4
+    STD $r4, %stack.0, 8
+    $w5 = LDB32 %stack.0, 0
+    $w6 = LDH32 %stack.0, 2
+    $w7 = LDW32 %stack.0, 4
+    $r8 = LDD %stack.0, 8
+    $r0 = COPY $r8
+    RET implicit $r0
+...
+---
+name:            direct_non_stack_memory
+alignment:       8
+tracksRegLiveness: true
+body:             |
+  bb.0.entry:
+    liveins: $w1, $w3, $r1
+
+    STB32 $w1, $r1, 0
+    STW32 $w3, $r1, 4
+    $w9 = LDB32 $r1, 0
+    $w2 = LDW32 $r1, 4
+    $r0 = COPY $r1
+    RET implicit $r0
+...
+---
+name:            mov64
+alignment:       8
+tracksRegLiveness: true
+body:             |
+  bb.0.entry:
+    liveins: $r2
+
+    $r1 = MOV_rr $r2
+    $r0 = COPY $r1
+    RET implicit $r0
+...
+---
+name:            prefetch_before_load
+alignment:       8
+tracksRegLiveness: true
+body:             |
+  bb.0.entry:
+    $r1 = LDD $r10, 0
+    $r0 = COPY $r1
+    RET implicit $r0
+...

@@ -1,0 +1,80 @@
+# RUN: llc -mtriple=bpfel -mcpu=v4 -run-pass=bpf-kinsn-select \
+# RUN:   -bpf-enable-kinsn-select \
+# RUN:   -bpf-kinsn-target=arm64 \
+# RUN:   -bpf-kinsn-mode=all=disable \
+# RUN:   -bpf-kinsn-mode=pair-mem=force -x mir %s -o - | FileCheck %s --check-prefix=FORCE
+# RUN: llc -mtriple=bpfel -mcpu=v4 -run-pass=bpf-kinsn-select \
+# RUN:   -bpf-enable-kinsn-select \
+# RUN:   -bpf-kinsn-target=arm64 \
+# RUN:   -bpf-kinsn-mode=all=disable -x mir %s -o - | FileCheck %s --check-prefix=DISABLE
+
+# FORCE: $r1, $r2 = BPF_KINSN_ARM64_LDP_X $r10, -16
+# FORCE-NOT: $r1 = LDD $r10, -16
+# FORCE: name: ldp_stack_pair_reversed
+# FORCE: $r1, $r2 = BPF_KINSN_ARM64_LDP_X $r10, -16
+# FORCE: name: ldp_stack_pair_frame_index
+# FORCE: $r1, $r2 = BPF_KINSN_ARM64_LDP_X %stack.0, 0
+# DISABLE-NOT: BPF_KINSN_ARM64_LDP_X
+# DISABLE: $r1 = LDD $r10, -16
+# DISABLE: name: ldp_stack_pair_reversed
+# DISABLE: $r2 = LDD $r10, -8
+# DISABLE: name: ldp_stack_pair_frame_index
+# DISABLE: $r1 = LDD %stack.0, 0
+
+--- |
+  target triple = "bpfel"
+
+  define dso_local i64 @ldp_stack_pair(i64 %x, i64 %y) #0 section "xdp" {
+  entry:
+    ret i64 %x
+  }
+
+  define dso_local i64 @ldp_stack_pair_reversed(i64 %x, i64 %y) #0 section "xdp" {
+  entry:
+    ret i64 %x
+  }
+
+  define dso_local i64 @ldp_stack_pair_frame_index(i64 %x, i64 %y) #0 section "xdp" {
+  entry:
+    ret i64 %x
+  }
+
+  attributes #0 = { "target-cpu"="v4" }
+...
+---
+name:            ldp_stack_pair
+alignment:       8
+tracksRegLiveness: true
+body:             |
+  bb.0.entry:
+    $r1 = LDD $r10, -16
+    $r2 = LDD $r10, -8
+    $r0 = COPY $r1
+    RET implicit $r0
+...
+---
+name:            ldp_stack_pair_reversed
+alignment:       8
+tracksRegLiveness: true
+body:             |
+  bb.0.entry:
+    $r2 = LDD $r10, -8
+    $r1 = LDD $r10, -16
+    $r0 = COPY $r1
+    RET implicit $r0
+...
+---
+name:            ldp_stack_pair_frame_index
+alignment:       8
+tracksRegLiveness: true
+stack:
+  - { id: 0, name: '', type: default, offset: 0, size: 16, alignment: 8,
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true,
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+body:             |
+  bb.0.entry:
+    $r1 = LDD %stack.0, 0
+    $r2 = LDD %stack.0, 8
+    $r0 = COPY $r1
+    RET implicit $r0
+...

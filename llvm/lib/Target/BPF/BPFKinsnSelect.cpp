@@ -25,6 +25,7 @@
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineJumpTableInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
@@ -96,6 +97,16 @@ static BPFKinsnPolicyKind parseBPFKinsnPolicyKind(StringRef Name) {
     return BPFKinsnPolicyKind::Cmov;
   if (Name == "ccmp")
     return BPFKinsnPolicyKind::Ccmp;
+  if (Name == "direct-load")
+    return BPFKinsnPolicyKind::DirectLoad;
+  if (Name == "direct-store")
+    return BPFKinsnPolicyKind::DirectStore;
+  if (Name == "pair-mem")
+    return BPFKinsnPolicyKind::PairMem;
+  if (Name == "mov")
+    return BPFKinsnPolicyKind::Mov;
+  if (Name == "prefetch")
+    return BPFKinsnPolicyKind::Prefetch;
   if (Name == "popcnt")
     return BPFKinsnPolicyKind::Popcnt;
   if (Name == "preemit-lea")
@@ -164,6 +175,13 @@ STATISTIC(NumShdSelected, "Number of SHLD/SHRD kinsn pseudos selected");
 STATISTIC(NumWideLoadSelected,
           "Number of little-endian byte-ladder loads packed");
 STATISTIC(NumCcmpSelected, "Number of boolean AND chains selected as CCMP/CSET");
+STATISTIC(NumDirectLoadSelected, "Number of direct load kinsn pseudos selected");
+STATISTIC(NumDirectStoreSelected,
+          "Number of direct store kinsn pseudos selected");
+STATISTIC(NumPairMemSelected,
+          "Number of adjacent pair load/store pseudos selected");
+STATISTIC(NumMovSelected, "Number of MOV kinsn pseudos selected");
+STATISTIC(NumPrefetchSelected, "Number of PRFM kinsn pseudos inserted");
 STATISTIC(NumCandidatesSkipped,
           "Number of non-profitable or overlapping kinsn candidates skipped");
 
@@ -260,7 +278,13 @@ struct Candidate {
     Bmi1,
     Rotate,
     Shd,
-    CcmpBoolAnd
+    CcmpBoolAnd,
+    DirectLoad,
+    DirectStore,
+    PairStore,
+    PairLoad,
+    Mov,
+    Prefetch
   } K;
   MachineInstr *Root;
   MachineInstr *Left = nullptr;
@@ -274,6 +298,8 @@ struct Candidate {
   int Score;
   SmallVector<MachineInstr *, 8> Erase;
   SmallVector<Register, 4> Terms;
+  bool HasFrameIndex = false;
+  int FrameIndex = 0;
 };
 
 class BPFKinsnSelect final : public MachineFunctionPass {
@@ -298,6 +324,7 @@ public:
     TII = MF.getSubtarget<BPFSubtarget>().getInstrInfo();
     MRI = &MF.getRegInfo();
     Loops = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
+    FunctionHasJumpTable = hasJumpTable(MF);
     bool LocalSubprog = isLocalSubprog(MF.getFunction());
 
     SmallVector<Candidate, 16> Candidates;
@@ -329,11 +356,17 @@ private:
   const BPFInstrInfo *TII = nullptr;
   MachineRegisterInfo *MRI = nullptr;
   MachineLoopInfo *Loops = nullptr;
+  bool FunctionHasJumpTable = false;
 
   static bool isLocalSubprog(const Function &F) {
     StringRef Section = F.getSection();
     return F.hasLocalLinkage() || Section.empty() || Section == ".text" ||
            Section.starts_with(".text.");
+  }
+
+  static bool hasJumpTable(const MachineFunction &MF) {
+    const MachineJumpTableInfo *JTI = MF.getJumpTableInfo();
+    return JTI && !JTI->getJumpTables().empty();
   }
 
   int blockWeight(const MachineBasicBlock &MBB) const {
@@ -389,6 +422,18 @@ private:
           collectRotate(MI, Out);
         if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Ccmp))
           collectCcmpBoolAnd(MI, Out);
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::DirectLoad))
+          collectDirectLoad(MI, Out);
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::DirectStore))
+          collectDirectStore(MI, Out);
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::PairMem))
+          collectPairStore(MI, Out);
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::PairMem))
+          collectPairLoad(MI, Out);
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Mov))
+          collectMov(MI, Out);
+        if (isBPFKinsnPolicyEnabled(BPFKinsnPolicyKind::Prefetch))
+          collectPrefetch(MI, Out);
       }
       return;
     }
@@ -740,9 +785,73 @@ private:
   }
 
   static bool isARM64LdrPseudo(unsigned Opcode) {
-    return Opcode == BPF::BPF_KINSN_ARM64_LDRH ||
+    return Opcode == BPF::BPF_KINSN_ARM64_LDRB ||
+           Opcode == BPF::BPF_KINSN_ARM64_LDRH ||
            Opcode == BPF::BPF_KINSN_ARM64_LDR_W ||
            Opcode == BPF::BPF_KINSN_ARM64_LDR_X;
+  }
+
+  static unsigned arm64DirectLoadPseudo(unsigned Opcode) {
+    switch (Opcode) {
+    case BPF::LDB32:
+      return BPF::BPF_KINSN_ARM64_LDRB;
+    case BPF::LDH32:
+      return BPF::BPF_KINSN_ARM64_LDRH;
+    case BPF::LDW32:
+      return BPF::BPF_KINSN_ARM64_LDR_W;
+    case BPF::LDD:
+      return BPF::BPF_KINSN_ARM64_LDR_X;
+    default:
+      return 0;
+    }
+  }
+
+  static unsigned arm64DirectLoadShift(unsigned PseudoOpcode) {
+    switch (PseudoOpcode) {
+    case BPF::BPF_KINSN_ARM64_LDRB:
+      return 0;
+    case BPF::BPF_KINSN_ARM64_LDRH:
+      return 1;
+    case BPF::BPF_KINSN_ARM64_LDR_W:
+      return 2;
+    case BPF::BPF_KINSN_ARM64_LDR_X:
+      return 3;
+    default:
+      llvm_unreachable("unexpected ARM64 direct load pseudo");
+    }
+  }
+
+  static unsigned arm64DirectStorePseudo(unsigned Opcode) {
+    switch (Opcode) {
+    case BPF::STB32:
+      return BPF::BPF_KINSN_ARM64_STRB;
+    case BPF::STH32:
+      return BPF::BPF_KINSN_ARM64_STRH;
+    case BPF::STW32:
+      return BPF::BPF_KINSN_ARM64_STR_W;
+    case BPF::STD:
+      return BPF::BPF_KINSN_ARM64_STR_X;
+    case BPF::STB_imm:
+      return BPF::BPF_KINSN_ARM64_STRB_ZERO;
+    default:
+      return 0;
+    }
+  }
+
+  static unsigned arm64DirectStoreShift(unsigned PseudoOpcode) {
+    switch (PseudoOpcode) {
+    case BPF::BPF_KINSN_ARM64_STRB:
+    case BPF::BPF_KINSN_ARM64_STRB_ZERO:
+      return 0;
+    case BPF::BPF_KINSN_ARM64_STRH:
+      return 1;
+    case BPF::BPF_KINSN_ARM64_STR_W:
+      return 2;
+    case BPF::BPF_KINSN_ARM64_STR_X:
+      return 3;
+    default:
+      llvm_unreachable("unexpected ARM64 direct store pseudo");
+    }
   }
 
   static bool arm64ScaledUOffOk(int64_t Offset, unsigned Shift) {
@@ -757,6 +866,298 @@ private:
   static bool arm64MemOffsetOk(int64_t Offset, unsigned Shift) {
     return isInt<16>(Offset) &&
            (arm64ScaledUOffOk(Offset, Shift) || arm64UnscaledSOffOk(Offset));
+  }
+
+  static bool arm64PairSOffOk(int64_t Offset) {
+    return isInt<16>(Offset) && Offset >= -512 && Offset <= 504 &&
+           Offset % 8 == 0;
+  }
+
+  static MachineInstr *nextNonDebugInstr(MachineInstr &MI) {
+    auto I = MI.getIterator();
+    MachineBasicBlock *MBB = MI.getParent();
+    for (++I; I != MBB->end(); ++I)
+      if (!I->isDebugInstr())
+        return &*I;
+    return nullptr;
+  }
+
+  static bool isSafePairStoreMI(const MachineInstr &MI) {
+    if (MI.getOpcode() != BPF::STD || MI.hasUnmodeledSideEffects())
+      return false;
+    for (const MachineMemOperand *MMO : MI.memoperands()) {
+      if (MMO->isVolatile() || MMO->isAtomic())
+        return false;
+    }
+    return true;
+  }
+
+  static bool isSafePairLoadMI(const MachineInstr &MI) {
+    if (MI.getOpcode() != BPF::LDD || MI.hasUnmodeledSideEffects())
+      return false;
+    for (const MachineMemOperand *MMO : MI.memoperands()) {
+      if (MMO->isVolatile() || MMO->isAtomic())
+        return false;
+    }
+    return true;
+  }
+
+  static bool isSafeMemoryMI(const MachineInstr &MI) {
+    if (MI.hasUnmodeledSideEffects())
+      return false;
+    for (const MachineMemOperand *MMO : MI.memoperands()) {
+      if (MMO->isVolatile() || MMO->isAtomic())
+        return false;
+    }
+    return true;
+  }
+
+  void collectDirectLoad(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    if (!isBPFKinsnTargetARM64() || !isSafeMemoryMI(MI))
+      return;
+
+    unsigned PseudoOpcode = arm64DirectLoadPseudo(MI.getOpcode());
+    if (!PseudoOpcode)
+      return;
+
+    const MachineOperand &BaseOp = MI.getOperand(1);
+    bool HasFrameIndex = BaseOp.isFI();
+    int FrameIndex = 0;
+    Register Base;
+    if (HasFrameIndex) {
+      FrameIndex = BaseOp.getIndex();
+    } else if (BaseOp.isReg()) {
+      Base = BaseOp.getReg();
+    } else {
+      return;
+    }
+    if (!HasFrameIndex && !isBPFReg10(Base))
+      return;
+
+    int64_t Offset = MI.getOperand(2).getImm();
+    if (!arm64MemOffsetOk(Offset, arm64DirectLoadShift(PseudoOpcode)))
+      return;
+    if (isBPFReg10(MI.getOperand(0).getReg()))
+      return;
+
+    int Score = isBPFKinsnPolicyForced(BPFKinsnPolicyKind::DirectLoad) ? 1 : -1;
+    Candidate C{Candidate::DirectLoad, &MI, nullptr, nullptr, nullptr,
+                PseudoOpcode, Register(), Base, Offset, 0, Score};
+    C.HasFrameIndex = HasFrameIndex;
+    C.FrameIndex = FrameIndex;
+    Out.push_back(std::move(C));
+  }
+
+  void collectDirectStore(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    if (!isBPFKinsnTargetARM64() || !isSafeMemoryMI(MI))
+      return;
+
+    unsigned PseudoOpcode = arm64DirectStorePseudo(MI.getOpcode());
+    if (!PseudoOpcode)
+      return;
+
+    bool StoreImmZero = PseudoOpcode == BPF::BPF_KINSN_ARM64_STRB_ZERO;
+    if (StoreImmZero && MI.getOperand(0).getImm() != 0)
+      return;
+
+    const MachineOperand &BaseOp = MI.getOperand(1);
+    bool HasFrameIndex = BaseOp.isFI();
+    int FrameIndex = 0;
+    Register Base;
+    if (HasFrameIndex) {
+      FrameIndex = BaseOp.getIndex();
+    } else if (BaseOp.isReg()) {
+      Base = BaseOp.getReg();
+    } else {
+      return;
+    }
+    if (!HasFrameIndex && !isBPFReg10(Base))
+      return;
+
+    int64_t Offset = MI.getOperand(2).getImm();
+    if (!arm64MemOffsetOk(Offset, arm64DirectStoreShift(PseudoOpcode)))
+      return;
+
+    Register Src = StoreImmZero ? Register() : MI.getOperand(0).getReg();
+    if (!StoreImmZero && isBPFReg10(Src))
+      return;
+
+    int Score =
+        isBPFKinsnPolicyForced(BPFKinsnPolicyKind::DirectStore) ? 1 : -1;
+    Candidate C{Candidate::DirectStore, &MI, nullptr, nullptr, nullptr,
+                PseudoOpcode, Src, Base, Offset, 0, Score};
+    C.HasFrameIndex = HasFrameIndex;
+    C.FrameIndex = FrameIndex;
+    Out.push_back(std::move(C));
+  }
+
+  void collectMov(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    if (!isBPFKinsnTargetARM64() || MI.getOpcode() != BPF::MOV_rr)
+      return;
+    if (!MI.getOperand(0).isReg() || !MI.getOperand(1).isReg())
+      return;
+
+    Register Dst = MI.getOperand(0).getReg();
+    if (isBPFReg10(Dst))
+      return;
+
+    int Score = isBPFKinsnPolicyForced(BPFKinsnPolicyKind::Mov) ? 1 : -1;
+    Out.push_back({Candidate::Mov, &MI, nullptr, nullptr, nullptr,
+                   BPF::BPF_KINSN_ARM64_MOV_X, MI.getOperand(1).getReg(),
+                   Register(), 0, 0, Score});
+  }
+
+  void collectPrefetch(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    if (!isBPFKinsnTargetARM64() || !isSafeMemoryMI(MI))
+      return;
+
+    // A BPF jump table is represented as LD_imm64(JTI) + ADD + LDD + JX.
+    // PRFM is only a hint, so keep it out of functions with jump tables until
+    // the raw-kinsn loader and verifier-side insn-array path can model kinsn
+    // sidecars in that control-flow pattern.
+    if (FunctionHasJumpTable)
+      return;
+
+    if (!arm64DirectLoadPseudo(MI.getOpcode()) &&
+        !arm64DirectStorePseudo(MI.getOpcode()))
+      return;
+    if (!MI.getOperand(1).isReg())
+      return;
+
+    if (MI.getOperand(2).getImm() != 0)
+      return;
+
+    int Score = isBPFKinsnPolicyForced(BPFKinsnPolicyKind::Prefetch) ? 1 : -1;
+    Out.push_back({Candidate::Prefetch, &MI, nullptr, nullptr, nullptr,
+                   BPF::BPF_KINSN_ARM64_PRFM_PLDL1KEEP, Register(),
+                   MI.getOperand(1).getReg(), 0, 0, Score});
+  }
+
+  void collectPairStore(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    if (!isBPFKinsnTargetARM64() || !isSafePairStoreMI(MI))
+      return;
+
+    MachineInstr *Next = nextNonDebugInstr(MI);
+    if (!Next || !isSafePairStoreMI(*Next))
+      return;
+
+    const MachineOperand &BaseOp = MI.getOperand(1);
+    const MachineOperand &NextBaseOp = Next->getOperand(1);
+    bool HasFrameIndex = BaseOp.isFI();
+    int FrameIndex = 0;
+    Register Base;
+    if (HasFrameIndex) {
+      if (!NextBaseOp.isFI() || NextBaseOp.getIndex() != BaseOp.getIndex())
+        return;
+      FrameIndex = BaseOp.getIndex();
+    } else {
+      if (!BaseOp.isReg() || !NextBaseOp.isReg())
+        return;
+      Base = BaseOp.getReg();
+      if (!isBPFReg10(Base) || NextBaseOp.getReg() != Base)
+        return;
+    }
+
+    if (!HasFrameIndex && !isBPFReg10(Base))
+      return;
+
+    Register SrcFirst = MI.getOperand(0).getReg();
+    Register SrcSecond = Next->getOperand(0).getReg();
+    if (isBPFReg10(SrcFirst) || isBPFReg10(SrcSecond))
+      return;
+
+    int64_t Offset = MI.getOperand(2).getImm();
+    int64_t NextOffset = Next->getOperand(2).getImm();
+    Register SrcLo;
+    Register SrcHi;
+    int64_t PairOffset;
+    if (NextOffset == Offset + 8) {
+      SrcLo = SrcFirst;
+      SrcHi = SrcSecond;
+      PairOffset = Offset;
+    } else if (NextOffset + 8 == Offset) {
+      SrcLo = SrcSecond;
+      SrcHi = SrcFirst;
+      PairOffset = NextOffset;
+    } else {
+      return;
+    }
+    if (!arm64PairSOffOk(PairOffset))
+      return;
+
+    int Score = isBPFKinsnPolicyForced(BPFKinsnPolicyKind::PairMem) ? 2 : -1;
+    Candidate C{Candidate::PairStore, &MI, Next, nullptr, nullptr,
+                BPF::BPF_KINSN_ARM64_STP_X, Register(), Base, PairOffset, 0,
+                Score};
+    C.Terms.push_back(SrcLo);
+    C.Terms.push_back(SrcHi);
+    C.HasFrameIndex = HasFrameIndex;
+    C.FrameIndex = FrameIndex;
+    Out.push_back(std::move(C));
+  }
+
+  void collectPairLoad(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
+    if (!isBPFKinsnTargetARM64() || !isSafePairLoadMI(MI))
+      return;
+
+    MachineInstr *Next = nextNonDebugInstr(MI);
+    if (!Next || !isSafePairLoadMI(*Next))
+      return;
+
+    const MachineOperand &BaseOp = MI.getOperand(1);
+    const MachineOperand &NextBaseOp = Next->getOperand(1);
+    bool HasFrameIndex = BaseOp.isFI();
+    int FrameIndex = 0;
+    Register Base;
+    if (HasFrameIndex) {
+      if (!NextBaseOp.isFI() || NextBaseOp.getIndex() != BaseOp.getIndex())
+        return;
+      FrameIndex = BaseOp.getIndex();
+    } else {
+      if (!BaseOp.isReg() || !NextBaseOp.isReg())
+        return;
+      Base = BaseOp.getReg();
+      if (!isBPFReg10(Base) || NextBaseOp.getReg() != Base)
+        return;
+    }
+
+    if (!HasFrameIndex && !isBPFReg10(Base))
+      return;
+
+    Register DstFirst = MI.getOperand(0).getReg();
+    Register DstSecond = Next->getOperand(0).getReg();
+    if (DstFirst == DstSecond || isBPFReg10(DstFirst) ||
+        isBPFReg10(DstSecond))
+      return;
+
+    int64_t Offset = MI.getOperand(2).getImm();
+    int64_t NextOffset = Next->getOperand(2).getImm();
+    Register DstLo;
+    Register DstHi;
+    int64_t PairOffset;
+    if (NextOffset == Offset + 8) {
+      DstLo = DstFirst;
+      DstHi = DstSecond;
+      PairOffset = Offset;
+    } else if (NextOffset + 8 == Offset) {
+      DstLo = DstSecond;
+      DstHi = DstFirst;
+      PairOffset = NextOffset;
+    } else {
+      return;
+    }
+    if (!arm64PairSOffOk(PairOffset))
+      return;
+
+    int Score = isBPFKinsnPolicyForced(BPFKinsnPolicyKind::PairMem) ? 2 : -1;
+    Candidate C{Candidate::PairLoad, &MI, Next, nullptr, nullptr,
+                BPF::BPF_KINSN_ARM64_LDP_X, Register(), Base, PairOffset, 0,
+                Score};
+    C.Terms.push_back(DstLo);
+    C.Terms.push_back(DstHi);
+    C.HasFrameIndex = HasFrameIndex;
+    C.FrameIndex = FrameIndex;
+    Out.push_back(std::move(C));
   }
 
   void collectIndexedLoad(MachineInstr &MI, SmallVectorImpl<Candidate> &Out) {
@@ -1208,6 +1609,39 @@ private:
       return true;
     }
 
+    if (C.K == Candidate::DirectLoad) {
+      BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
+              C.Root->getOperand(0).getReg())
+          .add(C.HasFrameIndex ? MachineOperand::CreateFI(C.FrameIndex)
+                               : MachineOperand::CreateReg(C.Base, false))
+          .addImm(C.Offset);
+      C.Root->eraseFromParent();
+      ++NumDirectLoadSelected;
+      return true;
+    }
+
+    if (C.K == Candidate::DirectStore) {
+      MachineInstrBuilder Builder =
+          BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode));
+      if (C.PseudoOpcode == BPF::BPF_KINSN_ARM64_STRB_ZERO) {
+        if (C.HasFrameIndex)
+          Builder.addFrameIndex(C.FrameIndex);
+        else
+          Builder.addReg(C.Base);
+        Builder.addImm(C.Offset);
+      } else {
+        Builder.addReg(C.Src);
+        if (C.HasFrameIndex)
+          Builder.addFrameIndex(C.FrameIndex);
+        else
+          Builder.addReg(C.Base);
+        Builder.addImm(C.Offset);
+      }
+      C.Root->eraseFromParent();
+      ++NumDirectStoreSelected;
+      return true;
+    }
+
     if (C.K == Candidate::IndexedLoad) {
       BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
               C.Root->getOperand(0).getReg())
@@ -1285,6 +1719,43 @@ private:
       for (MachineInstr *MI : C.Erase)
         MI->eraseFromParent();
       ++NumCcmpSelected;
+      return true;
+    }
+
+    if (C.K == Candidate::PairStore || C.K == Candidate::PairLoad) {
+      MachineInstrBuilder MIB =
+          BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode));
+      if (C.K == Candidate::PairLoad) {
+        MIB.addReg(C.Terms[0], RegState::Define)
+            .addReg(C.Terms[1], RegState::Define);
+      } else {
+        MIB.addReg(C.Terms[0]).addReg(C.Terms[1]);
+      }
+      if (C.HasFrameIndex)
+        MIB.addFrameIndex(C.FrameIndex);
+      else
+        MIB.addReg(C.Base);
+      MIB.addImm(C.Offset);
+      C.Root->eraseFromParent();
+      if (C.Left)
+        C.Left->eraseFromParent();
+      ++NumPairMemSelected;
+      return true;
+    }
+
+    if (C.K == Candidate::Mov) {
+      BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode),
+              C.Root->getOperand(0).getReg())
+          .addReg(C.Src);
+      C.Root->eraseFromParent();
+      ++NumMovSelected;
+      return true;
+    }
+
+    if (C.K == Candidate::Prefetch) {
+      BuildMI(MBB, C.Root, C.Root->getDebugLoc(), TII->get(C.PseudoOpcode))
+          .addReg(C.Base);
+      ++NumPrefetchSelected;
       return true;
     }
 
